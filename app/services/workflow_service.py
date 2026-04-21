@@ -83,7 +83,7 @@ class WorkflowService:
                 'completed_tasks': [],
             }
             logger.info('Starting workflow execution %s', workflow.id)
-            result = graph.invoke(initial_state)
+            result = graph.invoke(initial_state, config={"recursion_limit": 50})
             logger.info('Workflow execution %s finished with status=%s', workflow.id, result.get('status'))
             return result
 
