@@ -23,7 +23,7 @@ class TaskOut(BaseModel):
 
 
 class POResult(BaseModel):
-    feature_summary: str
+    feature_summary: str = Field(default="", description="Summary of the analyzed features")
     user_stories: list[StoryOut] = Field(default_factory=list)
     backlog_items: list[BacklogItemOut] = Field(default_factory=list)
     implementation_tasks: list[TaskOut] = Field(default_factory=list)
@@ -32,14 +32,14 @@ class POResult(BaseModel):
 class DevResult(BaseModel):
     file_name: str = Field(description="The suggested name for the source code file, e.g., 'auth.py' or 'App.tsx'")
     code: str
-    unit_tests: str
-    implementation_notes: str
+    unit_tests: str = Field(default="", description="The unit tests for the implementation")
+    implementation_notes: str = Field(default="", description="Notes about the implementation")
     included_markers: list[str] = Field(default_factory=list)
 
 
 class QCResult(BaseModel):
     passed: bool
-    status: str
-    validation_report: str
+    status: str = Field(default="COMPLETED", description="Status of the validation (e.g., PASSED, FAILED)")
+    validation_report: str = Field(default="", description="Detailed report of the validation")
     failed_criteria: list[str] = Field(default_factory=list)
     severity: str = 'MEDIUM'

@@ -82,13 +82,21 @@ class WorkflowNodes:
         tasks = po_result['implementation_tasks']
         persisted_backlog: list[dict] = []
         persisted_tasks: list[dict] = []
+
+        # Step 1: Create all backlog items first
+        db_backlog_map: list[int] = []  # list of db backlog IDs by index
         for idx, backlog_item in enumerate(backlog_items, start=1):
             db_backlog = self.orchestrator.ctx.task_repo.create_backlog_item(updated['workflow_id'], backlog_item['title'], backlog_item['description'], backlog_item['team'], idx)
             persisted_backlog.append({'id': db_backlog.id, **backlog_item})
-            task_data = tasks[idx - 1]
+            db_backlog_map.append(db_backlog.id)
+
+        # Step 2: Create tasks, linking each to a backlog item by index.
+        # If there are more tasks than backlog items, extra tasks link to the last backlog item.
+        for task_idx, task_data in enumerate(tasks):
+            backlog_id = db_backlog_map[min(task_idx, len(db_backlog_map) - 1)] if db_backlog_map else None
             db_task = self.orchestrator.ctx.task_repo.create_task(
                 workflow_id=updated['workflow_id'],
-                backlog_item_id=db_backlog.id,
+                backlog_item_id=backlog_id,
                 title=task_data['title'],
                 description=task_data['description'],
                 assignee_team=task_data['assignee_team'],

@@ -29,15 +29,20 @@ class DevAgent(OpenAIAPIAgent):
             
         prompt = f"""
         You are a Senior Software Engineer. Implement the following task.
-        Provide a suitable 'file_name' for your implementation (e.g., 'service.py', 'component.tsx').
         
         Task: {task.get('title')}
         Description: {task.get('description')}
         Acceptance Criteria: {acceptance_criteria}
         {bug_context}
         
-        Return the source code, unit tests, and implementation notes.
-        Make sure to include 'included_markers' which are the technical features you implemented.
+        Requirements for your response:
+        1. file_name: A suitable name for the source code file (e.g., 'service.py', 'component.tsx').
+        2. code: The complete source code implementation.
+        3. unit_tests: Comprehensive unit tests for the implementation.
+        4. implementation_notes: Detailed notes about your implementation and how to use it.
+        5. included_markers: A list of technical features or markers you implemented.
+        
+        Return the source code, unit tests, and implementation notes in the structured format.
         """
         return structured_llm.invoke(prompt)
 
@@ -55,6 +60,13 @@ class QCAgent(OpenAIAPIAgent):
         Unit Tests: {dev_output.get('unit_tests')}
         Implementation Notes: {dev_output.get('implementation_notes')}
         
-        Determine if it passed all criteria. If not, list failed criteria and severity.
+        Requirements for your response:
+        1. passed: Boolean (true/false) indicating if all acceptance criteria were met.
+        2. status: A string status (e.g., 'PASSED', 'FAILED', 'NEEDS_REVISION').
+        3. validation_report: A detailed explanation of your findings.
+        4. failed_criteria: A list of specific criteria that were not met.
+        5. severity: The severity of any issues found ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL').
+        
+        Determine if it passed all criteria and provide the structured validation result.
         """
         return structured_llm.invoke(prompt)
