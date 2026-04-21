@@ -1,7 +1,7 @@
 import type { Workflow } from '../types'
 import { StatusBadge } from './StatusBadge'
 
-export function WorkflowList({ workflows, selectedWorkflowId, onSelect, onRun, onStop, onDelete }: { workflows: Workflow[]; selectedWorkflowId: number | null; onSelect: (id: number) => void; onRun: (id: number) => void; onStop: (id: number) => void; onDelete: (id: number) => void }) {
+export function WorkflowList({ workflows, selectedWorkflowId, onSelect, onRun, onResume, onStop, onDelete }: { workflows: Workflow[]; selectedWorkflowId: number | null; onSelect: (id: number) => void; onRun: (id: number) => void; onResume: (id: number) => void; onStop: (id: number) => void; onDelete: (id: number) => void }) {
   return (
     <div className="panel">
       <div className="panel-header"><h2>Workflow List</h2></div>
@@ -18,10 +18,18 @@ export function WorkflowList({ workflows, selectedWorkflowId, onSelect, onRun, o
               <td>{workflow.current_agent || '-'}</td>
               <td>
                 <div style={{ display: 'flex', gap: '8px' }}>
-                  <button onClick={(e) => { e.stopPropagation(); onRun(workflow.id) }}>Run</button>
-                  <button 
-                    className="danger-btn" 
-                    style={{ background: '#f59e0b' }} 
+                  <button onClick={(e) => { e.stopPropagation(); onRun(workflow.id) }} disabled={workflow.status !== 'NEW'}>Run</button>
+                  {['CANCELLED', 'BLOCKED', 'MAX_RETRY_EXCEEDED', 'FAILED', 'PASSED'].includes(workflow.status) && (
+                    <button
+                      style={{ background: '#10b981' }}
+                      onClick={(e) => { e.stopPropagation(); onResume(workflow.id) }}
+                    >
+                      Resume
+                    </button>
+                  )}
+                  <button
+                    className="danger-btn"
+                    style={{ background: '#f59e0b' }}
                     onClick={(e) => { e.stopPropagation(); onStop(workflow.id) }}
                     disabled={!['PO_ANALYZING', 'BACKLOG_CREATED', 'TASK_READY_FOR_DEV', 'DEV_IN_PROGRESS', 'DEV_DONE', 'QC_IN_PROGRESS', 'QC_FAILED', 'BUG_CREATED', 'REOPENED_FOR_DEV'].includes(workflow.status)}
                   >

@@ -81,6 +81,16 @@ def stop_workflow(workflow_id: int, db: Session = Depends(get_db)):
     return {'message': 'Workflow cancellation requested.'}
 
 
+@router.post('/{workflow_id}/resume', response_model=TriggerWorkflowResponse)
+def resume_workflow(workflow_id: int, background_tasks: BackgroundTasks, sync: bool = False):
+    service = WorkflowService(session_factory=_session_factory)
+    if sync:
+        service.resume_workflow(workflow_id)
+    else:
+        background_tasks.add_task(service.resume_workflow, workflow_id)
+    return TriggerWorkflowResponse(workflow_id=workflow_id, status='RESUMING', message='Workflow resumption has been triggered.')
+
+
 @router.get('/{workflow_id}/events', response_model=list[EventLogRead])
 def list_workflow_events(workflow_id: int, db: Session = Depends(get_db)):
     return AuditRepository(db).list_events(workflow_id=workflow_id)

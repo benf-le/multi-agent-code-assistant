@@ -38,3 +38,7 @@ class BRDRepository:
     def list_user_stories(self, workflow_id: int) -> list[UserStory]:
         stmt = select(UserStory).where(UserStory.workflow_id == workflow_id).order_by(UserStory.id)
         return list(self.session.scalars(stmt).all())
+
+    def get_feature(self, workflow_id: int) -> Feature | None:
+        stmt = select(Feature).where(Feature.workflow_id == workflow_id).limit(1)
+        return self.session.scalar(stmt)

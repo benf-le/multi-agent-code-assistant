@@ -149,6 +149,7 @@ export default function App() {
           selectedWorkflowId={selectedWorkflowId}
           onSelect={setSelectedWorkflowId}
           onRun={(workflowId) => api.triggerWorkflow(workflowId).then(() => loadWorkflow(workflowId))}
+          onResume={(workflowId) => api.resumeWorkflow(workflowId).then(() => loadWorkflow(workflowId))}
           onStop={(workflowId) => api.stopWorkflow(workflowId).then(() => loadWorkflow(workflowId))}
           onDelete={handleDeleteWorkflow}
         />

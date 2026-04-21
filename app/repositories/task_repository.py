@@ -98,3 +98,7 @@ class TaskRepository:
     def list_bugs_for_task(self, task_id: int) -> list[BugReport]:
         stmt = select(BugReport).where(BugReport.task_id == task_id).order_by(BugReport.id)
         return list(self.session.scalars(stmt).all())
+
+    def list_backlog_items(self, workflow_id: int) -> list[BacklogItem]:
+        stmt = select(BacklogItem).where(BacklogItem.workflow_id == workflow_id).order_by(BacklogItem.sequence)
+        return list(self.session.scalars(stmt).all())

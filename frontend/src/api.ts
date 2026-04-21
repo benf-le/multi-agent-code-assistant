@@ -16,6 +16,7 @@ export const api = {
   getWorkflow: (workflowId: number) => request<WorkflowDetail>(`/workflows/${workflowId}`),
   deleteWorkflow: (workflowId: number) => request(`/workflows/${workflowId}`, { method: 'DELETE' }),
   triggerWorkflow: (workflowId: number) => request(`/workflows/${workflowId}/run`, { method: 'POST' }),
+  resumeWorkflow: (workflowId: number) => request(`/workflows/${workflowId}/resume`, { method: 'POST' }),
   stopWorkflow: (workflowId: number) => request(`/workflows/${workflowId}/stop`, { method: 'POST' }),
   listTasks: (params?: { status?: string; assignee_team?: string; retry_count_gte?: number }) => {
     const search = new URLSearchParams()

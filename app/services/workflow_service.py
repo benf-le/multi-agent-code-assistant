@@ -5,8 +5,9 @@ from sqlalchemy.orm import Session
 
 from app.agents.openai_agents import POAgent, DevAgent, QCAgent
 from app.core.config import get_settings
-from app.core.enums import AgentName, WorkflowStatus
+from app.core.enums import AgentName, WorkflowStatus, TaskStatus
 from app.graph.nodes import WorkflowNodes
+from app.graph.state import WorkflowState
 from app.graph.workflow import WorkflowGraphFactory
 from app.repositories.audit_repository import AuditRepository
 from app.repositories.brd_repository import BRDRepository
@@ -83,6 +84,88 @@ class WorkflowService:
                 'completed_tasks': [],
             }
             logger.info('Starting workflow execution %s', workflow.id)
+            result = graph.invoke(initial_state, config={"recursion_limit": 50})
+            logger.info('Workflow execution %s finished with status=%s', workflow.id, result.get('status'))
+            return result
+
+    def resume_workflow(self, workflow_id: int) -> dict:
+        with self.session_factory() as session:
+            orchestrator = self._build_context(session)
+            workflow = orchestrator.ctx.workflow_repo.get(workflow_id)
+            if workflow is None:
+                raise ValueError(f'Workflow {workflow_id} not found')
+            
+            # Reset cancellation status if needed
+            if workflow.status == WorkflowStatus.CANCELLED.value:
+                transitions = orchestrator.ctx.audit_repo.list_transitions(workflow_id=workflow_id)
+                # Take the status before 'CANCELLED' or default to BACKLOG_CREATED if we can't find one
+                prev_status = WorkflowStatus.NEW.value
+                for t in reversed(transitions):
+                    if t.to_status != WorkflowStatus.CANCELLED.value:
+                        prev_status = t.to_status
+                        break
+                orchestrator.ctx.workflow_repo.update_status(workflow, status=prev_status, current_agent=workflow.current_agent)
+                session.commit()
+
+            brd = orchestrator.ctx.brd_repo.get_brd(workflow.brd_id)
+            feature = orchestrator.ctx.brd_repo.get_feature(workflow.id)
+            user_stories = orchestrator.ctx.brd_repo.list_user_stories(workflow.id)
+            
+            # Reconstruct State
+            tasks = orchestrator.ctx.task_repo.list_tasks(workflow_id)
+            serialized_tasks = [orchestrator.serialize_task(t.id) for t in tasks]
+            
+            completed_tasks = [t for t in serialized_tasks if t['status'] == TaskStatus.DONE.value]
+            blocked_tasks = [t for t in serialized_tasks if t['status'] == TaskStatus.BLOCKED.value]
+            
+            # Identify current task
+            current_task = next((t for t in serialized_tasks if t['status'] in [TaskStatus.DEV_IN_PROGRESS.value, TaskStatus.QC_IN_PROGRESS.value, TaskStatus.REOPENED.value, TaskStatus.READY.value]), None)
+            
+            # Prepare task queue
+            task_queue = [t for t in serialized_tasks if t['status'] in [TaskStatus.NEW.value, TaskStatus.READY.value, TaskStatus.REOPENED.value] and (current_task is None or t['id'] != current_task['id'])]
+            task_queue.sort(key=lambda x: x['task_number'])
+
+            # Bug reports
+            all_bugs = []
+            for t in tasks:
+                bugs = orchestrator.ctx.task_repo.list_bugs_for_task(t.id)
+                for b in bugs:
+                    all_bugs.append({'id': b.id, 'title': b.title, 'description': b.description, 'severity': b.severity, 'failed_criteria': b.failed_criteria, 'task_id': t.id})
+
+            backlog_items = orchestrator.ctx.task_repo.list_backlog_items(workflow.id)
+
+            initial_state: WorkflowState = {
+                'workflow_id': workflow.id,
+                'brd_id': brd.id,
+                'brd_content': brd.content,
+                'feature_summary': feature.summary if feature else '',
+                'user_stories': [{'id': s.id, 'title': s.title, 'description': s.description, 'priority': s.priority} for s in user_stories],
+                'acceptance_criteria': [], # We don't strictly need the global list if they are in tasks/stories
+                'backlog': [{'id': b.id, 'title': b.title, 'description': b.description, 'team': b.team} for b in backlog_items],
+                'current_task': current_task,
+                'task_queue': task_queue,
+                'task_history': completed_tasks + blocked_tasks,
+                'dev_output': current_task.get('output_context') if current_task else None,
+                'qc_result': None, # Will be re-run if resuming at QC
+                'bug_reports': all_bugs,
+                'retry_count': current_task.get('retry_count', 0) if current_task else 0,
+                'max_retry': workflow.max_retry,
+                'current_agent': workflow.current_agent or AgentName.ORCHESTRATOR.value,
+                'status': workflow.status,
+                'event_logs': [],
+                'timestamps': {'started_at': workflow.started_at.isoformat() if workflow.started_at else orchestrator.now_iso()},
+                'blocked_tasks': blocked_tasks,
+                'completed_tasks': completed_tasks,
+            }
+
+            logger.info('Resuming workflow execution %s from status=%s', workflow.id, workflow.status)
+            
+            po = POAgent(self.settings.openai_api_key)
+            dev = DevAgent(self.settings.openai_api_key)
+            qc = QCAgent(self.settings.openai_api_key)
+            nodes = WorkflowNodes(orchestrator, po, dev, qc)
+            graph = WorkflowGraphFactory(nodes).build()
+            
             result = graph.invoke(initial_state, config={"recursion_limit": 50})
             logger.info('Workflow execution %s finished with status=%s', workflow.id, result.get('status'))
             return result
