@@ -30,11 +30,19 @@ class POResult(BaseModel):
 
 
 class DevResult(BaseModel):
-    file_name: str = Field(description="The suggested name for the source code file, e.g., 'auth.py' or 'App.tsx'")
+    file_path: str = Field(
+        description="The relative file path within the project structure, e.g., 'app/api/admin.py', 'app/services/auth_service.py', 'tests/test_admin.py'. "
+                    "Must reflect a proper project layout (no flat names like 'admin_api.py' at root)."
+    )
     code: str
     unit_tests: str = Field(default="", description="The unit tests for the implementation")
     implementation_notes: str = Field(default="", description="Notes about the implementation")
     included_markers: list[str] = Field(default_factory=list)
+
+    @property
+    def file_name(self) -> str:
+        """Backward-compat: basename of file_path."""
+        return self.file_path.split('/')[-1].split('\\')[-1]
 
 
 class QCResult(BaseModel):

@@ -28,7 +28,7 @@ class DevAgent(OpenAIAPIAgent):
             bug_context = f"\nPlease fix these bugs from previous QC:\n{bug_reports}"
             
         prompt = f"""
-        You are a Senior Software Engineer. Implement the following task.
+        You are a Senior Software Engineer. Implement the following task as part of a larger software project.
         
         Task: {task.get('title')}
         Description: {task.get('description')}
@@ -36,7 +36,9 @@ class DevAgent(OpenAIAPIAgent):
         {bug_context}
         
         Requirements for your response:
-        1. file_name: A suitable name for the source code file (e.g., 'service.py', 'component.tsx').
+        1. file_path: A relative path inside the project (e.g., 'app/api/admin.py', 'app/services/user_service.py',
+           'frontend/src/components/Login.tsx', 'tests/test_admin.py'). Reflect a proper project layout.
+           Do NOT return just a bare filename like 'admin_api.py'—always include the subdirectory.
         2. code: The complete source code implementation.
         3. unit_tests: Comprehensive unit tests for the implementation.
         4. implementation_notes: Detailed notes about your implementation and how to use it.
