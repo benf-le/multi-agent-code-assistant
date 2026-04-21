@@ -1,8 +1,8 @@
 from datetime import datetime
 from pydantic import BaseModel
 
-from app.schemas.common import EventLogRead, StateTransitionRead
-from app.schemas.task import TaskRead
+from app.schemas.common import EventLogSummary, StateTransitionRead
+from app.schemas.task import TaskSummary
 
 
 class WorkflowRead(BaseModel):
@@ -22,9 +22,9 @@ class WorkflowRead(BaseModel):
 
 class WorkflowDetailResponse(BaseModel):
     workflow: WorkflowRead
-    tasks: list[TaskRead]
+    tasks: list[TaskSummary]
     transitions: list[StateTransitionRead]
-    events: list[EventLogRead]
+    events: list[EventLogSummary]
 
 
 class TriggerWorkflowResponse(BaseModel):

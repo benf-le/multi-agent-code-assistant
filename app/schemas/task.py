@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from app.schemas.common import EventLogRead, StateTransitionRead
 
 
-class TaskRead(BaseModel):
+class TaskSummary(BaseModel):
     id: int
     workflow_id: int
     backlog_item_id: int | None
@@ -17,13 +17,16 @@ class TaskRead(BaseModel):
     max_retry: int
     current_agent: str | None
     required_markers: list[str]
-    input_context: dict
-    output_context: dict
     latest_bug_id: int | None
     created_at: datetime
     updated_at: datetime
 
     model_config = {'from_attributes': True}
+
+
+class TaskRead(TaskSummary):
+    input_context: dict
+    output_context: dict
 
 
 class TaskDetailResponse(BaseModel):

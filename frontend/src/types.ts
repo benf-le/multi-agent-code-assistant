@@ -23,8 +23,8 @@ export type Task = {
   max_retry: number
   current_agent: string | null
   required_markers: string[]
-  input_context: Record<string, unknown>
-  output_context: Record<string, unknown>
+  input_context?: Record<string, unknown>
+  output_context?: Record<string, unknown>
   latest_bug_id: number | null
   created_at: string
   updated_at: string
@@ -37,7 +37,7 @@ export type EventLog = {
   event_type: string
   agent_name: string | null
   message: string
-  payload: Record<string, unknown>
+  payload?: Record<string, unknown>
   created_at: string
 }
 
