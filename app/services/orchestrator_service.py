@@ -127,6 +127,7 @@ class OrchestratorService:
         return {
             'id': task.id,
             'workflow_id': task.workflow_id,
+            'task_number': task.task_number,
             'title': task.title,
             'description': task.description,
             'assignee_team': task.assignee_team,

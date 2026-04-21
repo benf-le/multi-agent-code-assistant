@@ -102,11 +102,11 @@ export default function App() {
   return (
     <div className="dark-app">
       <div className="control-header">
-        <WorkflowList 
-          workflows={workflows} 
-          selectedWorkflowId={selectedWorkflowId} 
-          onSelect={setSelectedWorkflowId} 
-          onRun={(workflowId) => api.triggerWorkflow(workflowId).then(() => loadWorkflow(workflowId))} 
+        <WorkflowList
+          workflows={workflows}
+          selectedWorkflowId={selectedWorkflowId}
+          onSelect={setSelectedWorkflowId}
+          onRun={(workflowId) => api.triggerWorkflow(workflowId).then(() => loadWorkflow(workflowId))}
           onStop={(workflowId) => api.stopWorkflow(workflowId).then(() => loadWorkflow(workflowId))}
           onDelete={handleDeleteWorkflow}
         />
@@ -145,7 +145,7 @@ export default function App() {
                   </div>
                 </div>
               ))}
-              {tasks.length === 0 && <div style={{color: '#64748b', fontSize: 13}}>No tasks yet.</div>}
+              {tasks.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No tasks yet.</div>}
             </div>
           </div>
 
@@ -159,7 +159,7 @@ export default function App() {
                   <span className="message">{e.message}</span>
                 </div>
               ))}
-              {feedEvents.length === 0 && <div style={{color: '#64748b', fontSize: 13}}>No events yet.</div>}
+              {feedEvents.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No events yet.</div>}
             </div>
           </div>
 
@@ -188,7 +188,7 @@ export default function App() {
                     <div className="card-body">{e.message}</div>
                   </div>
                 ))}
-                {resultEvents.length === 0 && <div style={{color: '#64748b', fontSize: 13}}>No results yet.</div>}
+                {resultEvents.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No results yet.</div>}
               </div>
             </div>
           </div>
@@ -204,7 +204,7 @@ export default function App() {
                   <div className="card-body">{e.message}</div>
                 </div>
               ))}
-              {mailboxEvents.length === 0 && <div style={{color: '#64748b', fontSize: 13}}>No messages yet.</div>}
+              {mailboxEvents.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No messages yet.</div>}
             </div>
           </div>
         </div>

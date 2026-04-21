@@ -115,7 +115,8 @@ class WorkflowNodes:
                 return updated
             updated['current_task'] = updated['task_queue'].pop(0)
         current_task = updated['current_task']
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.TASK_READY_FOR_DEV.value, AgentName.ORCHESTRATOR.value, f"Task {current_task['id']} dispatched to DEV.", task_id=current_task['id'])
+        task_display = f"t-{current_task['task_number']:03d}"
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.TASK_READY_FOR_DEV.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} dispatched to DEV.", task_id=current_task['id'])
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.READY.value, AgentName.ORCHESTRATOR.value, 'Task prepared for DEV implementation.')
         updated['status'] = WorkflowStatus.TASK_READY_FOR_DEV.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
@@ -126,8 +127,9 @@ class WorkflowNodes:
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         current_task = updated['current_task']
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV is implementing task {current_task['id']}.", task_id=current_task['id'])
-        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, 'DEV started implementation.')
+        task_display = f"t-{current_task['task_number']:03d}"
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV is implementing task {task_display}.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV started implementation for {task_display}.")
         bug_reports = self.orchestrator.ctx.task_repo.list_bugs_for_task(current_task['id'])
         dev_result = self.dev_agent.implement(
             task=current_task,
@@ -138,8 +140,9 @@ class WorkflowNodes:
         db_task = self.orchestrator.ctx.task_repo.get_task(current_task['id'])
         assert db_task is not None
         self.orchestrator.ctx.task_repo.save_task_output(db_task, output_payload)
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEV_DONE.value, AgentName.DEV.value, f"DEV completed task {current_task['id']}.", task_id=current_task['id'])
-        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_DONE.value, AgentName.DEV.value, 'DEV finished implementation.')
+        task_display = f"t-{current_task['task_number']:03d}"
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEV_DONE.value, AgentName.DEV.value, f"DEV completed task {task_display}.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_DONE.value, AgentName.DEV.value, f"DEV finished implementation for {task_display}.")
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.DEV.value, 'SUCCESS', task_id=current_task['id'], input_payload={'task': current_task}, output_payload=output_payload)
         current_task['output_context'] = output_payload
         
@@ -174,8 +177,9 @@ class WorkflowNodes:
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         current_task = updated['current_task']
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.QC_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Task {current_task['id']} dispatched to QC.", task_id=current_task['id'])
-        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.QC_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, 'Task prepared for QC validation.')
+        task_display = f"t-{current_task['task_number']:03d}"
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.QC_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} dispatched to QC.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.QC_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} prepared for QC validation.")
         updated['status'] = WorkflowStatus.QC_IN_PROGRESS.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
         return updated
@@ -185,8 +189,9 @@ class WorkflowNodes:
         updated = deepcopy(state)
         current_task = updated['current_task']
         qc_result = self.qc_agent.validate(current_task, current_task['acceptance_criteria'], updated['dev_output'] or {})
+        task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.QC.value, 'SUCCESS', task_id=current_task['id'], input_payload={'task': current_task, 'dev_output': updated.get('dev_output')}, output_payload=qc_result.model_dump())
-        self.orchestrator.update_workflow_status(updated['workflow_id'], qc_result.status, AgentName.QC.value, f"QC validated task {current_task['id']}: {qc_result.status}", task_id=current_task['id'])
+        self.orchestrator.update_workflow_status(updated['workflow_id'], qc_result.status, AgentName.QC.value, f"QC validated task {task_display}: {qc_result.status}", task_id=current_task['id'])
         task_status = TaskStatus.DONE.value if qc_result.passed else TaskStatus.QC_FAILED.value
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], task_status, AgentName.QC.value, qc_result.validation_report)
         updated['qc_result'] = qc_result.model_dump()
@@ -199,10 +204,11 @@ class WorkflowNodes:
         updated = deepcopy(state)
         current_task = updated['current_task']
         qc_result = updated['qc_result'] or {}
+        task_display = f"t-{current_task['task_number']:03d}"
         bug = self.orchestrator.ctx.task_repo.create_bug(
             workflow_id=updated['workflow_id'],
             task_id=current_task['id'],
-            title=f"Bug for task {current_task['id']}",
+            title=f"Bug for task {task_display}",
             description=qc_result.get('validation_report', 'QC validation failed.'),
             severity=qc_result.get('severity', 'MEDIUM'),
             failed_criteria=qc_result.get('failed_criteria', []),
@@ -210,9 +216,9 @@ class WorkflowNodes:
         db_task = self.orchestrator.ctx.task_repo.get_task(current_task['id'])
         assert db_task is not None
         self.orchestrator.ctx.task_repo.increment_retry(db_task)
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.BUG_CREATED.value, AgentName.QC.value, f"QC created bug {bug.id} for task {current_task['id']}.", task_id=current_task['id'])
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.REOPENED_FOR_DEV.value, AgentName.ORCHESTRATOR.value, f"Task {current_task['id']} reopened for DEV after bug {bug.id}.", task_id=current_task['id'])
-        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.REOPENED.value, AgentName.ORCHESTRATOR.value, 'Task reopened for DEV re-implementation.')
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.BUG_CREATED.value, AgentName.QC.value, f"QC created bug {bug.id} for task {task_display}.", task_id=current_task['id'])
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.REOPENED_FOR_DEV.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} reopened for DEV after bug {bug.id}.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.REOPENED.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} reopened for DEV re-implementation.")
         current_task = self.orchestrator.serialize_task(current_task['id'])
         updated['current_task'] = current_task
         updated['bug_reports'] = [*updated.get('bug_reports', []), {'id': bug.id, 'title': bug.title, 'description': bug.description, 'severity': bug.severity, 'failed_criteria': bug.failed_criteria, 'task_id': current_task['id']}]
@@ -238,8 +244,9 @@ class WorkflowNodes:
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         current_task = updated['current_task']
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.MAX_RETRY_EXCEEDED.value, AgentName.ORCHESTRATOR.value, f"Task {current_task['id']} exceeded max retry limit.", task_id=current_task['id'])
-        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.BLOCKED.value, AgentName.ORCHESTRATOR.value, 'Max retry exceeded. Task blocked.')
+        task_display = f"t-{current_task['task_number']:03d}"
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.MAX_RETRY_EXCEEDED.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} exceeded max retry limit.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.BLOCKED.value, AgentName.ORCHESTRATOR.value, f"Max retry exceeded for {task_display}. Task blocked.")
         blocked = self.orchestrator.serialize_task(current_task['id'])
         updated['blocked_tasks'] = [*updated.get('blocked_tasks', []), blocked]
         updated['task_history'] = [*updated.get('task_history', []), blocked]
