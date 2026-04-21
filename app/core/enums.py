@@ -1,0 +1,45 @@
+from enum import Enum
+
+
+class WorkflowStatus(str, Enum):
+    NEW = 'NEW'
+    PO_ANALYZING = 'PO_ANALYZING'
+    BACKLOG_CREATED = 'BACKLOG_CREATED'
+    TASK_READY_FOR_DEV = 'TASK_READY_FOR_DEV'
+    DEV_IN_PROGRESS = 'DEV_IN_PROGRESS'
+    DEV_DONE = 'DEV_DONE'
+    QC_IN_PROGRESS = 'QC_IN_PROGRESS'
+    QC_FAILED = 'QC_FAILED'
+    QC_PASSED = 'QC_PASSED'
+    BUG_CREATED = 'BUG_CREATED'
+    REOPENED_FOR_DEV = 'REOPENED_FOR_DEV'
+    DONE = 'DONE'
+    BLOCKED = 'BLOCKED'
+    MAX_RETRY_EXCEEDED = 'MAX_RETRY_EXCEEDED'
+    CANCELLED = 'CANCELLED'
+
+
+class AgentName(str, Enum):
+    ORCHESTRATOR = 'ORCHESTRATOR'
+    PO = 'PO'
+    DEV = 'DEV'
+    QC = 'QC'
+
+
+class BugSeverity(str, Enum):
+    LOW = 'LOW'
+    MEDIUM = 'MEDIUM'
+    HIGH = 'HIGH'
+    CRITICAL = 'CRITICAL'
+
+
+class TaskStatus(str, Enum):
+    NEW = 'NEW'
+    READY = 'READY'
+    DEV_IN_PROGRESS = 'DEV_IN_PROGRESS'
+    DEV_DONE = 'DEV_DONE'
+    QC_IN_PROGRESS = 'QC_IN_PROGRESS'
+    QC_FAILED = 'QC_FAILED'
+    DONE = 'DONE'
+    BLOCKED = 'BLOCKED'
+    REOPENED = 'REOPENED'
