@@ -219,23 +219,24 @@ export default function App() {
                 )}
               </div>
             </div>
-            <div className="sub-section">
-              <h2 className="col-header">RESULTS</h2>
-              <div className="col-content">
-                {resultEvents.map(e => (
-                  <div key={`res-${e.id}`} className="card result-card">
-                    <div className="card-header">
-                      <span className={`agent-badge ${e.agent_name?.toLowerCase()}`}>{e.agent_name}</span>
-                    </div>
-                    <div className="card-body">{e.message}</div>
-                  </div>
-                ))}
-                {resultEvents.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No results yet.</div>}
-              </div>
-            </div>
           </div>
 
+
           <div className="col mailbox-sec">
+            <h2 className="col-header">RESULTS</h2>
+            <div className="col-content">
+              {resultEvents.map(e => (
+                <div key={`res-${e.id}`} className="card result-card">
+                  <div className="card-header">
+                    <span className={`agent-badge ${e.agent_name?.toLowerCase()}`}>{e.agent_name}</span>
+                  </div>
+                  <div className="card-body">{e.message}</div>
+                </div>
+              ))}
+              {resultEvents.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No results yet.</div>}
+            </div>
+
+            {/* Hidden Mailbox Section
             <h2 className="col-header">MAILBOX</h2>
             <div className="col-content">
               {mailboxEvents.map(e => (
@@ -254,6 +255,7 @@ export default function App() {
               ))}
               {mailboxEvents.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No messages yet.</div>}
             </div>
+            */}
           </div>
         </div>
       </div>
