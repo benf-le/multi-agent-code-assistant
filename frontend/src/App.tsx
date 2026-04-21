@@ -43,9 +43,9 @@ export default function App() {
         setSelectedWorkflowId(null)
         setSelectedWorkflow(null)
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to delete workflow:', error)
-      alert('Failed to delete workflow')
+      alert(error.message || 'Failed to delete workflow')
     }
   }
 

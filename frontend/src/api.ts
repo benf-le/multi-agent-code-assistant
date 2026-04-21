@@ -7,9 +7,23 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     ...options,
   })
-  if (!response.ok) throw new Error(`API error: ${response.status}`)
+  if (!response.ok) {
+    let msg = `API error: ${response.status}`
+    try {
+      const errorData = await response.json()
+      if (errorData && errorData.detail) {
+        msg = typeof errorData.detail === 'string' ? errorData.detail : JSON.stringify(errorData.detail)
+      } else if (errorData && errorData.message) {
+        msg = errorData.message
+      }
+    } catch {
+      // ignore parse error
+    }
+    throw new Error(msg)
+  }
   return response.json() as Promise<T>
 }
+
 
 export const api = {
   listWorkflows: () => request<Workflow[]>('/workflows'),

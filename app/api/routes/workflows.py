@@ -50,10 +50,26 @@ def get_workflow_detail(workflow_id: int, db: Session = Depends(get_db)):
 @router.delete('/{workflow_id}')
 def delete_workflow(workflow_id: int, db: Session = Depends(get_db)):
     workflow_repo = WorkflowRepository(db)
-    success = workflow_repo.delete(workflow_id)
-    if not success:
-        raise HTTPException(status_code=404, detail='Workflow not found')
-    return {'message': 'Workflow deleted successfully'}
+    try:
+        success = workflow_repo.delete(workflow_id)
+        if not success:
+            raise HTTPException(status_code=404, detail='Workflow not found')
+        return {'message': 'Workflow deleted successfully'}
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        # Log the full error for server logs
+        import logging
+        logging.getLogger(__name__).error(f"Error deleting workflow {workflow_id}: {error_msg}", exc_info=True)
+        
+        if "ForeignKeyViolation" in error_msg or "foreign key constraint" in error_msg:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Cannot delete workflow because it is still referenced by other data: {error_msg}"
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to delete workflow: {error_msg}")
+
 
 
 @router.post('/{workflow_id}/run', response_model=TriggerWorkflowResponse)
