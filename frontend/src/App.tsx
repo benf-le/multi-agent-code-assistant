@@ -86,7 +86,49 @@ export default function App() {
     return Array.from(agents)
   }, [tasks])
 
-  const mailboxEvents = useMemo(() => events.filter(e => (e.message || '').includes('[MAIL]') || e.event_type === 'mail' || (e.message || '').includes('->')), [events])
+  const mailboxEvents = useMemo(() => {
+    const rawEvents = events.filter(e => {
+      const msg = e.message || ''
+      const lowerMsg = msg.toLowerCase()
+      return msg.includes('[MAIL]') ||
+        e.event_type === 'mail' ||
+        msg.includes('->') ||
+        lowerMsg.includes('dispatched to') ||
+        lowerMsg.includes('reopened for') ||
+        (lowerMsg.includes('completed task') && e.agent_name === 'DEV') ||
+        (lowerMsg.includes('validated task') && e.agent_name === 'QC') ||
+        (lowerMsg.includes('created backlog') && e.agent_name === 'PO')
+    })
+
+    return rawEvents.map(e => {
+      const msg = e.message || ''
+      let caller = e.agent_name || 'SYSTEM'
+      let callee = ''
+      let text = msg
+
+      if (msg.includes('->')) {
+        const parts = msg.replace('[MAIL]', '').split('->')
+        caller = parts[0].trim() || caller
+        const subparts = (parts[1] || '').split(':')
+        callee = subparts[0].trim()
+        text = subparts.slice(1).join(':').trim() || msg
+      } else if (msg.toLowerCase().includes('dispatched to dev')) {
+        callee = 'DEV'
+      } else if (msg.toLowerCase().includes('dispatched to qc')) {
+        callee = 'QC'
+      } else if (msg.toLowerCase().includes('reopened for dev')) {
+        callee = 'DEV'
+      } else if (msg.toLowerCase().includes('completed task') && caller === 'DEV') {
+        callee = 'ORCHESTRATOR'
+      } else if (msg.toLowerCase().includes('validated task') && caller === 'QC') {
+        callee = 'ORCHESTRATOR'
+      } else if (msg.toLowerCase().includes('created backlog') && caller === 'PO') {
+        callee = 'ORCHESTRATOR'
+      }
+
+      return { ...e, caller, callee, parsedMessage: text }
+    })
+  }, [events])
   const resultEvents = useMemo(() => events.filter(e => (e.message || '').toLowerCase().includes('pass') || (e.message || '').toLowerCase().includes('fail') || e.event_type.includes('result') || e.event_type.includes('qc')), [events])
   const feedEvents = events
 
@@ -198,10 +240,16 @@ export default function App() {
             <div className="col-content">
               {mailboxEvents.map(e => (
                 <div key={`mail-${e.id}`} className="card mail-card">
-                  <div className="card-header">
-                    <span className={`agent-badge ${e.agent_name?.toLowerCase()}`}>{e.agent_name}</span>
+                  <div className="card-header" style={{ display: 'flex', alignItems: 'center' }}>
+                    <span className={`agent-badge ${(e.caller || '').toLowerCase()}`}>{e.caller}</span>
+                    {e.callee && (
+                      <>
+                        <span style={{ margin: '0 8px', color: '#64748b', fontSize: '14px' }}>➔</span>
+                        <span className={`agent-badge ${e.callee.toLowerCase()}`}>{e.callee}</span>
+                      </>
+                    )}
                   </div>
-                  <div className="card-body">{e.message}</div>
+                  <div className="card-body">{e.parsedMessage}</div>
                 </div>
               ))}
               {mailboxEvents.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No messages yet.</div>}
