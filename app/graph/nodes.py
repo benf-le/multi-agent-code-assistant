@@ -46,6 +46,7 @@ class WorkflowNodes:
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.PO_ANALYZING.value, AgentName.PO.value, 'PO agent is analyzing BRD.')
+        self._check_cancelled(updated['workflow_id'])
         result = self.po_agent.analyze(updated['brd_content'])
         self.orchestrator.ctx.brd_repo.create_feature(updated['workflow_id'], result.feature_summary)
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.PO.value, 'SUCCESS', input_payload={'brd_id': updated['brd_id']}, output_payload=result.model_dump())
@@ -130,6 +131,7 @@ class WorkflowNodes:
         task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV is implementing task {task_display}.", task_id=current_task['id'])
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV started implementation for {task_display}.")
+        self._check_cancelled(updated['workflow_id'])
         bug_reports = self.orchestrator.ctx.task_repo.list_bugs_for_task(current_task['id'])
         dev_result = self.dev_agent.implement(
             task=current_task,
@@ -188,6 +190,7 @@ class WorkflowNodes:
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         current_task = updated['current_task']
+        self._check_cancelled(updated['workflow_id'])
         qc_result = self.qc_agent.validate(current_task, current_task['acceptance_criteria'], updated['dev_output'] or {})
         task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.QC.value, 'SUCCESS', task_id=current_task['id'], input_payload={'task': current_task, 'dev_output': updated.get('dev_output')}, output_payload=qc_result.model_dump())

@@ -31,13 +31,23 @@ class OrchestratorService:
 
     def check_cancellation(self, workflow_id: int) -> bool:
         """Returns True if the workflow has been cancelled."""
+        # Use a fresh query to avoid identity map cache
+        self.ctx.session.expire_all() # Or more specifically expire the workflow
         workflow = self.ctx.workflow_repo.get(workflow_id)
+        if workflow:
+            self.ctx.session.refresh(workflow)
         return workflow is not None and workflow.status == 'CANCELLED'
 
     def update_workflow_status(self, workflow_id: int, to_status: str, agent_name: str, reason: str, task_id: int | None = None, metadata: dict | None = None) -> None:
         workflow = self.ctx.workflow_repo.get(workflow_id)
         if workflow is None:
             raise ValueError(f'Workflow {workflow_id} not found')
+        
+        # Ensure we have the latest status from DB
+        self.ctx.session.refresh(workflow)
+        if workflow.status == 'CANCELLED' and to_status != 'CANCELLED':
+            raise InterruptedError(f"Cannot update status of cancelled workflow {workflow_id}")
+
         from_status = workflow.status
         self.ctx.workflow_repo.update_status(workflow, status=to_status, current_agent=agent_name)
         self.ctx.audit_repo.create_transition(
@@ -60,6 +70,10 @@ class OrchestratorService:
         self.ctx.session.commit()
 
     def update_task_status(self, workflow_id: int, task_id: int, to_status: str, agent_name: str, reason: str, metadata: dict | None = None) -> None:
+        # Check workflow cancellation first
+        if self.check_cancellation(workflow_id):
+            raise InterruptedError(f"Workflow {workflow_id} was cancelled.")
+
         task = self.ctx.task_repo.get_task(task_id)
         if task is None:
             raise ValueError(f'Task {task_id} not found')
@@ -100,6 +114,11 @@ class OrchestratorService:
         workflow = self.ctx.workflow_repo.get(workflow_id)
         if workflow is None:
             raise ValueError(f'Workflow {workflow_id} not found')
+        
+        self.ctx.session.refresh(workflow)
+        if workflow.status == 'CANCELLED':
+            return # Already cancelled, don't overwrite with DONE
+            
         from_status = workflow.status
         self.ctx.workflow_repo.mark_finished(workflow, status=status)
         self.ctx.audit_repo.create_transition(
