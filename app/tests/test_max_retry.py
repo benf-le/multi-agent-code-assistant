@@ -9,7 +9,10 @@ def test_max_retry_exceeded_blocks_workflow(workflow_service, session_factory):
         max_retry=0,
     )
     result = workflow_service.run_workflow(workflow_id)
-    assert result['status'] == 'BLOCKED'
+
+    # The refactored service returns final_status at the top level
+    final_status = result.get('final_status', result.get('status'))
+    assert final_status == 'BLOCKED'
 
     with session_factory() as session:
         workflow = WorkflowRepository(session).get(workflow_id)

@@ -10,7 +10,7 @@ def to_pretty_json(data) -> str:
 
 class OpenAIAPIAgent:
     """Base class for OpenAI-powered agents."""
-    def __init__(self, api_key: str, model: str = "gpt-4o"):
+    def __init__(self, api_key: str, model: str = "gpt-5-nano"):
         self.llm = ChatOpenAI(model=model, api_key=api_key, temperature=0)
 
 

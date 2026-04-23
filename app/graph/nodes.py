@@ -20,6 +20,10 @@ class WorkflowNodes:
         if self.orchestrator.check_cancellation(workflow_id):
             raise InterruptedError(f"Workflow {workflow_id} was cancelled by user.")
 
+    # ──────────────────────────────────────────────────────────────────────
+    #  PO Phase Nodes (used by build_po_graph)
+    # ──────────────────────────────────────────────────────────────────────
+
     def ingest_brd(self, state: WorkflowState) -> WorkflowState:
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
@@ -116,14 +120,16 @@ class WorkflowNodes:
         updated.pop('po_result', None)
         return updated
 
+    # ──────────────────────────────────────────────────────────────────────
+    #  Task Execution Nodes (used by build_task_graph)
+    # ──────────────────────────────────────────────────────────────────────
+
     def dispatch_to_dev(self, state: WorkflowState) -> WorkflowState:
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
-        if updated.get('current_task') is None:
-            if not updated.get('task_queue'):
-                return updated
-            updated['current_task'] = updated['task_queue'].pop(0)
         current_task = updated['current_task']
+        if current_task is None:
+            raise ValueError("dispatch_to_dev called with no current_task — state was not properly initialized by the service layer.")
         task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.TASK_READY_FOR_DEV.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} dispatched to DEV.", task_id=current_task['id'])
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.READY.value, AgentName.ORCHESTRATOR.value, 'Task prepared for DEV implementation.')
@@ -235,6 +241,12 @@ class WorkflowNodes:
         updated['qc_result'] = qc_result.model_dump()
         updated['status'] = qc_result.status
         updated['current_agent'] = AgentName.QC.value
+
+        # Record loop signature for detection (only on failure, since pass exits immediately)
+        if not qc_result.passed:
+            sig = f"{current_task.get('id')}:{updated.get('retry_count', 0)}:{qc_result.validation_report[:80] if qc_result.validation_report else ''}"
+            updated['loop_signatures'] = [*updated.get('loop_signatures', []), sig]
+
         return updated
 
     def create_bug(self, state: WorkflowState) -> WorkflowState:
@@ -266,6 +278,11 @@ class WorkflowNodes:
         return updated
 
     def mark_task_done(self, state: WorkflowState) -> WorkflowState:
+        """Mark the current task as DONE. Does NOT advance to the next task.
+
+        The service layer is responsible for picking the next task and
+        invoking a new graph run.
+        """
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         current_task = self.orchestrator.serialize_task(updated['current_task']['id'])
@@ -279,11 +296,28 @@ class WorkflowNodes:
         return updated
 
     def max_retry_exceeded(self, state: WorkflowState) -> WorkflowState:
+        """Mark the current task as BLOCKED due to max retry or loop detection.
+
+        Does NOT advance to the next task. The service layer handles that.
+        """
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         current_task = updated['current_task']
         task_display = f"t-{current_task['task_number']:03d}"
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.MAX_RETRY_EXCEEDED.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} exceeded max retry limit.", task_id=current_task['id'])
+
+        # Determine if this was triggered by loop detection or genuine max_retry
+        loop_sigs = updated.get('loop_signatures', [])
+        if loop_sigs:
+            sig = loop_sigs[-1] if loop_sigs else ''
+            count = sum(1 for s in loop_sigs if s == sig)
+            if count >= 3:
+                reason = f"Task {task_display} blocked by loop detection (no progress after {count} identical cycles)."
+            else:
+                reason = f"Task {task_display} exceeded max retry limit."
+        else:
+            reason = f"Task {task_display} exceeded max retry limit."
+
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.MAX_RETRY_EXCEEDED.value, AgentName.ORCHESTRATOR.value, reason, task_id=current_task['id'])
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.BLOCKED.value, AgentName.ORCHESTRATOR.value, f"Max retry exceeded for {task_display}. Task blocked.")
         blocked = self.orchestrator.serialize_task(current_task['id'])
         updated['blocked_tasks'] = [*updated.get('blocked_tasks', []), blocked]
@@ -293,14 +327,4 @@ class WorkflowNodes:
         updated['qc_result'] = None
         updated['status'] = WorkflowStatus.MAX_RETRY_EXCEEDED.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
-        return updated
-
-    def finalize_workflow(self, state: WorkflowState) -> WorkflowState:
-        self._check_cancelled(state['workflow_id'])
-        updated = deepcopy(state)
-        final_status = WorkflowStatus.BLOCKED.value if updated.get('blocked_tasks') else WorkflowStatus.DONE.value
-        self.orchestrator.mark_workflow_finished(updated['workflow_id'], final_status, 'Workflow finished after processing all tasks.')
-        updated['status'] = final_status
-        updated['current_agent'] = AgentName.ORCHESTRATOR.value
-        updated['timestamps'] = {**updated.get('timestamps', {}), 'completed_at': self.orchestrator.now_iso()}
         return updated
