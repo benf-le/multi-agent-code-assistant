@@ -15,6 +15,7 @@ from app.repositories.task_repository import TaskRepository
 from app.repositories.workflow_repository import WorkflowRepository
 from app.services.event_bus import DatabaseEventBus
 from app.services.orchestrator_service import OrchestratorContext, OrchestratorService
+from app.core.logging_helper import WorkflowLogger
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,11 @@ class WorkflowService:
     def _finalize_workflow(self, orchestrator: OrchestratorService, workflow_id: int) -> str:
         """Recompute and persist the final workflow status after all tasks are processed."""
         final_status = self._recompute_workflow_status(orchestrator, workflow_id)
+        WorkflowLogger.info("workflow.finalized", 
+            workflow_id=workflow_id, 
+            final_status=final_status,
+            message=f"Workflow finalized with status: {final_status}"
+        )
         if final_status in (WorkflowStatus.DONE.value, WorkflowStatus.BLOCKED.value):
             orchestrator.mark_workflow_finished(workflow_id, final_status, f'Workflow finished: {final_status}.')
         return final_status
@@ -143,8 +149,16 @@ class WorkflowService:
         runnable = [t for t in tasks if t.status in _RUNNABLE_TASK_STATUSES]
         runnable.sort(key=lambda t: t.task_number)
         if runnable:
-            return orchestrator.serialize_task(runnable[0].id)
+            task = runnable[0]
+            WorkflowLogger.info("workflow.task.selected",
+                workflow_id=workflow_id,
+                task_id=task.id,
+                task_number=task.task_number,
+                status=task.status
+            )
+            return orchestrator.serialize_task(task.id)
 
+        WorkflowLogger.info("workflow.task.none_left", workflow_id=workflow_id)
         return None
 
     # ──────────────────────────────────────────────────────────────────────
@@ -176,6 +190,8 @@ class WorkflowService:
             'blocked_tasks': [],
             'completed_tasks': [],
             'loop_signatures': [],
+            'visited_nodes': [],
+            'route_decisions': [],
         }
 
     def _build_task_state(self, orchestrator: OrchestratorService, workflow, brd, task_dict: dict) -> WorkflowState:
@@ -208,6 +224,8 @@ class WorkflowService:
             'blocked_tasks': [],
             'completed_tasks': [],
             'loop_signatures': [],
+            'visited_nodes': [],
+            'route_decisions': [],
         }
 
     # ──────────────────────────────────────────────────────────────────────
@@ -225,7 +243,17 @@ class WorkflowService:
         state = self._build_po_state(workflow, brd)
 
         try:
+            WorkflowLogger.info("workflow.graph.start", 
+                workflow_id=workflow.id, 
+                graph_name="po_graph",
+                recursion_limit=self._graph_config().get("recursion_limit")
+            )
             result = po_graph.invoke(state, config=self._graph_config())
+            WorkflowLogger.info("workflow.graph.end", 
+                workflow_id=workflow.id, 
+                graph_name="po_graph",
+                visited_nodes=result.get("visited_nodes", [])
+            )
             logger.info('PO phase completed for workflow %s', workflow.id)
             return result
         except Exception as e:
@@ -250,7 +278,22 @@ class WorkflowService:
         state = self._build_task_state(orchestrator, workflow, brd, task_dict)
 
         try:
-            result = task_graph.invoke(state, config=self._graph_config())
+            config = self._graph_config()
+            WorkflowLogger.info("workflow.graph.start", 
+                workflow_id=workflow.id, 
+                task_id=task_dict['id'],
+                task_number=task_dict['task_number'],
+                graph_name="task_graph",
+                recursion_limit=config.get("recursion_limit")
+            )
+            result = task_graph.invoke(state, config=config)
+            WorkflowLogger.info("workflow.graph.end", 
+                workflow_id=workflow.id, 
+                task_id=task_dict['id'],
+                graph_name="task_graph",
+                status=result.get('status'),
+                visited_nodes=result.get("visited_nodes", [])
+            )
             logger.info('Task %s finished with status=%s', task_display, result.get('status'))
             return result
         except InterruptedError:
@@ -264,6 +307,7 @@ class WorkflowService:
                 'current_task': None,
                 'status': WorkflowStatus.MAX_RETRY_EXCEEDED.value,
                 'error': str(e),
+                'visited_nodes': state.get('visited_nodes', []),
             }
 
     # ──────────────────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@ from app.agents.openai_agents import POAgent, DevAgent, QCAgent
 from app.core.enums import AgentName, TaskStatus, WorkflowStatus
 from app.graph.state import WorkflowState
 from app.services.orchestrator_service import OrchestratorService
+from app.core.logging_helper import WorkflowLogger
 
 
 class WorkflowNodes:
@@ -20,35 +21,65 @@ class WorkflowNodes:
         if self.orchestrator.check_cancellation(workflow_id):
             raise InterruptedError(f"Workflow {workflow_id} was cancelled by user.")
 
+    def _log_node_enter(self, name: str, state: WorkflowState):
+        current_task = state.get('current_task') or {}
+        WorkflowLogger.info("workflow.node.enter",
+            workflow_id=state.get('workflow_id'),
+            node_name=name,
+            task_id=current_task.get('id'),
+            task_number=current_task.get('task_number'),
+            retry_count=state.get('retry_count'),
+            status=state.get('status')
+        )
+
+    def _log_node_exit(self, name: str, state: WorkflowState):
+        current_task = state.get('current_task') or {}
+        WorkflowLogger.info("workflow.node.exit",
+            workflow_id=state.get('workflow_id'),
+            node_name=name,
+            task_id=current_task.get('id'),
+            task_number=current_task.get('task_number'),
+            status=state.get('status')
+        )
+
     # ──────────────────────────────────────────────────────────────────────
     #  PO Phase Nodes (used by build_po_graph)
     # ──────────────────────────────────────────────────────────────────────
 
     def ingest_brd(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('ingest_brd', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'ingest_brd']
         updated['timestamps'] = {**updated.get('timestamps', {}), 'ingest_brd': self.orchestrator.now_iso()}
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.NEW.value, AgentName.ORCHESTRATOR.value, 'BRD ingested into workflow state.')
         updated['status'] = WorkflowStatus.NEW.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
+        self._log_node_exit('ingest_brd', updated)
         return updated
 
     def orchestrator_init(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('orchestrator_init', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'orchestrator_init']
         updated['event_logs'] = updated.get('event_logs', [])
         updated['task_history'] = updated.get('task_history', [])
         updated['completed_tasks'] = updated.get('completed_tasks', [])
         updated['blocked_tasks'] = updated.get('blocked_tasks', [])
         updated['bug_reports'] = updated.get('bug_reports', [])
+        updated['route_decisions'] = updated.get('route_decisions', [])
         updated['current_task'] = None
         updated['dev_output'] = None
         updated['qc_result'] = None
+        self._log_node_exit('orchestrator_init', updated)
         return updated
 
     def po_analyze_brd(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('po_analyze_brd', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'po_analyze_brd']
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.PO_ANALYZING.value, AgentName.PO.value, 'PO agent is analyzing BRD.')
         self._check_cancelled(updated['workflow_id'])
         result = self.po_agent.analyze(updated['brd_content'])
@@ -59,11 +90,14 @@ class WorkflowNodes:
         updated['po_result'] = result.model_dump()
         updated['current_agent'] = AgentName.PO.value
         updated['status'] = WorkflowStatus.PO_ANALYZING.value
+        self._log_node_exit('po_analyze_brd', updated)
         return updated
 
     def po_create_user_stories(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('po_create_user_stories', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'po_create_user_stories']
         po_result = updated['po_result']
         persisted_stories: list[dict] = []
         persisted_criteria: list[dict] = []
@@ -76,11 +110,14 @@ class WorkflowNodes:
         self.orchestrator.ctx.session.commit()
         updated['user_stories'] = persisted_stories
         updated['acceptance_criteria'] = persisted_criteria
+        self._log_node_exit('po_create_user_stories', updated)
         return updated
 
     def po_create_backlog_and_tasks(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('po_create_backlog_and_tasks', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'po_create_backlog_and_tasks']
         po_result = updated['po_result']
         backlog_items = po_result['backlog_items']
         tasks = po_result['implementation_tasks']
@@ -118,6 +155,7 @@ class WorkflowNodes:
         updated['status'] = WorkflowStatus.BACKLOG_CREATED.value
         updated['current_agent'] = AgentName.PO.value
         updated.pop('po_result', None)
+        self._log_node_exit('po_create_backlog_and_tasks', updated)
         return updated
 
     # ──────────────────────────────────────────────────────────────────────
@@ -125,8 +163,10 @@ class WorkflowNodes:
     # ──────────────────────────────────────────────────────────────────────
 
     def dispatch_to_dev(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('dispatch_to_dev', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'dispatch_to_dev']
         current_task = updated['current_task']
         if current_task is None:
             raise ValueError("dispatch_to_dev called with no current_task — state was not properly initialized by the service layer.")
@@ -136,11 +176,14 @@ class WorkflowNodes:
         updated['status'] = WorkflowStatus.TASK_READY_FOR_DEV.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
         updated['retry_count'] = current_task['retry_count']
+        self._log_node_exit('dispatch_to_dev', updated)
         return updated
 
     def dev_implement(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('dev_implement', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'dev_implement']
         current_task = updated['current_task']
         task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV is implementing task {task_display}.", task_id=current_task['id'])
@@ -169,6 +212,7 @@ class WorkflowNodes:
         updated['dev_output'] = output_payload
         updated['status'] = WorkflowStatus.DEV_DONE.value
         updated['current_agent'] = AgentName.DEV.value
+        self._log_node_exit('dev_implement', updated)
         return updated
 
     def _save_physical_files(self, workflow_id: int, task: dict, dev_result):
@@ -217,19 +261,24 @@ class WorkflowNodes:
             print(f"[wf_{workflow_id}] Error saving physical files: {e}")
 
     def dispatch_to_qc(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('dispatch_to_qc', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'dispatch_to_qc']
         current_task = updated['current_task']
         task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.QC_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} dispatched to QC.", task_id=current_task['id'])
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.QC_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} prepared for QC validation.")
         updated['status'] = WorkflowStatus.QC_IN_PROGRESS.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
+        self._log_node_exit('dispatch_to_qc', updated)
         return updated
 
     def qc_validate(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('qc_validate', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'qc_validate']
         current_task = updated['current_task']
         self._check_cancelled(updated['workflow_id'])
         qc_result = self.qc_agent.validate(current_task, current_task['acceptance_criteria'], updated['dev_output'] or {})
@@ -247,11 +296,14 @@ class WorkflowNodes:
             sig = f"{current_task.get('id')}:{updated.get('retry_count', 0)}:{qc_result.validation_report[:80] if qc_result.validation_report else ''}"
             updated['loop_signatures'] = [*updated.get('loop_signatures', []), sig]
 
+        self._log_node_exit('qc_validate', updated)
         return updated
 
     def create_bug(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('create_bug', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'create_bug']
         current_task = updated['current_task']
         qc_result = updated['qc_result'] or {}
         task_display = f"t-{current_task['task_number']:03d}"
@@ -275,16 +327,15 @@ class WorkflowNodes:
         updated['retry_count'] = current_task['retry_count']
         updated['status'] = WorkflowStatus.REOPENED_FOR_DEV.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
+        self._log_node_exit('create_bug', updated)
         return updated
 
     def mark_task_done(self, state: WorkflowState) -> WorkflowState:
-        """Mark the current task as DONE. Does NOT advance to the next task.
-
-        The service layer is responsible for picking the next task and
-        invoking a new graph run.
-        """
+        """Mark the current task as DONE. Does NOT advance to the next task."""
+        self._log_node_enter('mark_task_done', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'mark_task_done']
         current_task = self.orchestrator.serialize_task(updated['current_task']['id'])
         updated['completed_tasks'] = [*updated.get('completed_tasks', []), current_task]
         updated['task_history'] = [*updated.get('task_history', []), current_task]
@@ -293,15 +344,15 @@ class WorkflowNodes:
         updated['qc_result'] = None
         updated['status'] = WorkflowStatus.DONE.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
+        self._log_node_exit('mark_task_done', updated)
         return updated
 
     def max_retry_exceeded(self, state: WorkflowState) -> WorkflowState:
-        """Mark the current task as BLOCKED due to max retry or loop detection.
-
-        Does NOT advance to the next task. The service layer handles that.
-        """
+        """Mark the current task as BLOCKED due to max retry or loop detection."""
+        self._log_node_enter('max_retry_exceeded', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'max_retry_exceeded']
         current_task = updated['current_task']
         task_display = f"t-{current_task['task_number']:03d}"
 
@@ -327,4 +378,5 @@ class WorkflowNodes:
         updated['qc_result'] = None
         updated['status'] = WorkflowStatus.MAX_RETRY_EXCEEDED.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
+        self._log_node_exit('max_retry_exceeded', updated)
         return updated

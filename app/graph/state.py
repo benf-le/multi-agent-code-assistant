@@ -24,5 +24,7 @@ class WorkflowState(TypedDict, total=False):
     status: str
     event_logs: list[dict[str, Any]]
     timestamps: dict[str, Any]
-    # Loop detection: list of (task_id, status, retry_count) signatures seen during this graph run
+    # Tracing
     loop_signatures: list[str]
+    visited_nodes: list[str]
+    route_decisions: list[dict[str, Any]]

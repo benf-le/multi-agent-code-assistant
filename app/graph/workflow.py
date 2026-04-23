@@ -3,6 +3,7 @@ from langgraph.graph import END, START, StateGraph
 from app.graph.nodes import WorkflowNodes
 from app.graph.router import route_by_qc_result
 from app.graph.state import WorkflowState
+from app.core.logging_helper import WorkflowLogger
 
 
 class WorkflowGraphFactory:
@@ -38,7 +39,26 @@ class WorkflowGraphFactory:
         graph.add_edge('po_analyze_brd', 'po_create_user_stories')
         graph.add_edge('po_create_user_stories', 'po_create_backlog_and_tasks')
         graph.add_edge('po_create_backlog_and_tasks', END)
-        return graph.compile()
+        
+        compiled = graph.compile()
+        self._log_topology("po_graph", compiled)
+        return compiled
+
+    def _log_topology(self, name: str, compiled_graph):
+        """Log a summary of the graph topology."""
+        try:
+            nodes = list(compiled_graph.nodes.keys())
+            # Simplistic edge extraction from internal structure if possible, 
+            # or just log the intent since we know the structure.
+            # LangGraph doesn't make it easy to traverse edges in a standard way without deeper inspection.
+            # But we can log the known structure from the factory methods.
+            WorkflowLogger.info("workflow.graph.static_view", 
+                graph_name=name,
+                nodes=nodes,
+                message=f"Graph '{name}' built with {len(nodes)} nodes."
+            )
+        except Exception as e:
+            WorkflowLogger.warning("workflow.graph.static_view_failed", graph_name=name, error=str(e))
 
     def build_task_graph(self):
         """Build the single-task execution graph (bounded retry cycle).
@@ -76,7 +96,9 @@ class WorkflowGraphFactory:
         graph.add_edge('mark_task_done', END)
         graph.add_edge('max_retry_exceeded', END)
 
-        return graph.compile()
+        compiled = graph.compile()
+        self._log_topology("task_graph", compiled)
+        return compiled
 
     def build(self):
         """Legacy method — returns the task graph for backward compatibility.
