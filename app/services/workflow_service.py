@@ -560,6 +560,7 @@ class WorkflowService:
                 break
 
             last_result = self._run_single_task(session, orchestrator, workflow, brd, task_dict)
+            session.commit()
             tasks_processed += 1
             logger.info('Workflow %s: processed %d tasks so far', workflow.id, tasks_processed)
 

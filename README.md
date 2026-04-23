@@ -76,7 +76,7 @@ pip install -r requirements.txt
 docker compose up -d postgres
 python scripts/init_db.py
 python scripts/seed_demo.py
-uvicorn app.main:app --reload --port 8001
+uvicorn app.main:app --port 8001
 ```
 
 API docs: `http://localhost:8001/docs`

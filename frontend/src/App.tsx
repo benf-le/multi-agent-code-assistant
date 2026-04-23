@@ -10,14 +10,37 @@ export default function App() {
   const [workflows, setWorkflows] = useState<Workflow[]>([])
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<number | null>(null)
   const [selectedWorkflow, setSelectedWorkflow] = useState<WorkflowDetail | null>(null)
+  const [isRefreshing, setIsRefreshing] = useState(false)
+
+  const STATUS_MAP: Record<string, string> = {
+    'TASK_READY_FOR_DEV': 'READY',
+    'READY': 'READY',
+    'DEV_IN_PROGRESS': 'IN PROGRESS',
+    'QC_IN_PROGRESS': 'IN QC',
+    'REOPENED': 'RETRY',
+    'REOPENED_FOR_DEV': 'RETRY',
+    'DONE': 'DONE',
+    'QC_PASSED': 'DONE',
+    'DEV_DONE': 'DEV DONE',
+    'QC_FAILED': 'QC FAILED',
+    'BLOCKED': 'BLOCKED',
+    'MAX_RETRY_EXCEEDED': 'BLOCKED',
+    'NEW': 'NEW',
+    'PO_ANALYZING': 'ANALYZING',
+    'BACKLOG_CREATED': 'BACKLOG',
+    'CANCELLED': 'CANCELLED'
+  }
 
   async function loadWorkflows() {
     try {
+      setIsRefreshing(true)
       const data = await api.listWorkflows()
       setWorkflows(data || [])
       if (!selectedWorkflowId && data && data.length > 0) setSelectedWorkflowId(data[0].id)
     } catch (e) {
-      console.error('Failed to load workflows:', e)
+      console.warn('Backend is temporarily unavailable (possible reload).')
+    } finally {
+      setIsRefreshing(false)
     }
   }
 
@@ -31,7 +54,7 @@ export default function App() {
       const detail = await api.getWorkflow(id)
       setSelectedWorkflow(detail)
     } catch (e) {
-      console.error('Failed to load workflow detail:', e)
+      // Silently fail for polling during reload
     }
   }
 
@@ -66,10 +89,10 @@ export default function App() {
   const stats = useMemo(() => {
     let running = 0, done = 0, pending = 0, blocked = 0
     tasks.forEach(t => {
-      const s = (t.status || 'NEW').toLowerCase()
-      if (s.includes('running') || s.includes('progress') || s.includes('started') || s === 'analyzing') running++
-      else if (s === 'done' || s.includes('passed') || s === 'finished' || s === 'completed') done++
-      else if (s.includes('failed') || s.includes('blocked') || s.includes('error') || s.includes('exceeded')) blocked++
+      const s = (t.status || 'NEW').toUpperCase()
+      if (s.includes('PROGRESS') || s === 'READY' || s === 'REOPENED') running++
+      else if (s === 'DONE' || s === 'QC_PASSED' || s === 'DEV_DONE') done++
+      else if (s === 'BLOCKED' || s === 'MAX_RETRY_EXCEEDED' || s === 'QC_FAILED') blocked++
       else pending++
     })
     return { total: tasks.length, running, done, pending, blocked }
@@ -77,14 +100,17 @@ export default function App() {
 
   const activeAgents = useMemo(() => {
     const agents = new Set<string>()
+    // Check if workflow itself is in a state that implies agent activity
+    if (selectedWorkflow?.workflow.status === 'PO_ANALYZING') agents.add('PO')
+    
     tasks.forEach(t => {
-      const s = (t.status || '').toLowerCase()
-      if ((s.includes('in_progress') || s === 'running') && t.current_agent) {
+      const s = (t.status || '').toUpperCase()
+      if ((s.includes('PROGRESS') || s === 'READY') && t.current_agent) {
         agents.add(t.current_agent)
       }
     })
     return Array.from(agents)
-  }, [tasks])
+  }, [tasks, selectedWorkflow])
 
   const mailboxEvents = useMemo(() => {
     const rawEvents = events.filter(e => {
@@ -168,7 +194,11 @@ export default function App() {
             <span className="stat-badge blocked"><span className="count">{stats.blocked}</span> Blocked</span>
           </div>
           <div className="status-indicator">
-            {activeAgents.length > 0 ? <span className="running">Processing...</span> : <span className="idle">Idle</span>}
+            {activeAgents.length > 0 ? (
+              <span className="running">Processing... ({activeAgents.join(', ')})</span>
+            ) : (
+              <span className="idle">{isRefreshing ? 'Refreshing...' : 'Idle'}</span>
+            )}
           </div>
         </div>
 
@@ -177,10 +207,10 @@ export default function App() {
             <h2 className="col-header">TASK BOARD</h2>
             <div className="col-content">
               {tasks.map(t => (
-                <div key={t.id} className={`card ${t.status}`}>
+                <div key={t.id} className={`card ${t.status.toLowerCase()}`}>
                   <div className="card-header">
                     <span className="task-id">t-{(t.task_number || 0).toString().padStart(3, '0')}</span>
-                    <span className="task-status">{t.status.replace(/_/g, ' ')}</span>
+                    <span className="task-status">{STATUS_MAP[t.status] || t.status.replace(/_/g, ' ')}</span>
                   </div>
                   <div className="card-title">{t.title}</div>
                   <div className="task-tags">
