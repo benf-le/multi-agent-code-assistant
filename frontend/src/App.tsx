@@ -152,10 +152,21 @@ export default function App() {
         callee = 'ORCHESTRATOR'
       }
 
-      return { ...e, caller, callee, parsedMessage: text }
+      const task = tasks.find(t => t.id === e.task_id)
+      return { ...e, caller, callee, parsedMessage: text, task_number: task?.task_number }
     })
-  }, [events])
-  const resultEvents = useMemo(() => events.filter(e => (e.message || '').toLowerCase().includes('pass') || (e.message || '').toLowerCase().includes('fail') || e.event_type.includes('result') || e.event_type.includes('qc')), [events])
+  }, [events, tasks])
+  const resultEvents = useMemo(() => {
+    const raw = events.filter(e => (e.message || '').toLowerCase().includes('pass') || (e.message || '').toLowerCase().includes('fail') || e.event_type.includes('result') || e.event_type.includes('qc'))
+    return raw.map(e => {
+      const task = tasks.find(t => t.id === e.task_id)
+      let msg = e.message
+      if (task && e.task_id) {
+        msg = msg.replace(new RegExp(`task ${e.task_id}`, 'gi'), `task t-${String(task.task_number).padStart(3, '0')}`)
+      }
+      return { ...e, task_number: task?.task_number, displayMessage: msg }
+    })
+  }, [events, tasks])
   const feedEvents = events
 
   function formatTime(iso: string | null | undefined) {
@@ -260,8 +271,9 @@ export default function App() {
                 <div key={`res-${e.id}`} className="card result-card">
                   <div className="card-header">
                     <span className={`agent-badge ${e.agent_name?.toLowerCase()}`}>{e.agent_name}</span>
+                    {e.task_number && <span className="task-ref">t-{String(e.task_number).padStart(3, '0')}</span>}
                   </div>
-                  <div className="card-body">{e.message}</div>
+                  <div className="card-body">{e.displayMessage}</div>
                 </div>
               ))}
               {resultEvents.length === 0 && <div style={{ color: '#64748b', fontSize: 13 }}>No results yet.</div>}
