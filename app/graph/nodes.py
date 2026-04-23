@@ -3,7 +3,7 @@ from copy import deepcopy
 import os
 from pathlib import Path
 
-from app.agents.openai_agents import POAgent, DevAgent, QCAgent
+from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent
 from app.core.enums import AgentName, TaskStatus, WorkflowStatus
 from app.graph.state import WorkflowState
 from app.services.orchestrator_service import OrchestratorService
@@ -11,9 +11,10 @@ from app.core.logging_helper import WorkflowLogger
 
 
 class WorkflowNodes:
-    def __init__(self, orchestrator: OrchestratorService, po_agent: POAgent, dev_agent: DevAgent, qc_agent: QCAgent):
+    def __init__(self, orchestrator: OrchestratorService, po_agent: POAgent, po_review_agent: POReviewAgent, dev_agent: DevAgent, qc_agent: QCAgent):
         self.orchestrator = orchestrator
         self.po_agent = po_agent
+        self.po_review_agent = po_review_agent
         self.dev_agent = dev_agent
         self.qc_agent = qc_agent
 
@@ -94,26 +95,29 @@ class WorkflowNodes:
         return updated
 
     def po_create_user_stories(self, state: WorkflowState) -> WorkflowState:
+        """Parse user stories from PO result into state (no DB persistence yet — deferred to po_review)."""
         self._log_node_enter('po_create_user_stories', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'po_create_user_stories']
         po_result = updated['po_result']
-        persisted_stories: list[dict] = []
-        persisted_criteria: list[dict] = []
-        for story in po_result['user_stories']:
-            db_story = self.orchestrator.ctx.brd_repo.create_user_story(updated['workflow_id'], story['title'], story['description'], story['priority'])
-            persisted_stories.append({'id': db_story.id, **story})
+
+        # Build story dicts from po_result — NOT persisted to DB yet.
+        staged_stories: list[dict] = []
+        staged_criteria: list[dict] = []
+        for idx, story in enumerate(po_result['user_stories']):
+            story_entry = {'_idx': idx, **story}
+            staged_stories.append(story_entry)
             for text in story['acceptance_criteria']:
-                criterion = self.orchestrator.ctx.brd_repo.create_acceptance_criterion(updated['workflow_id'], text, user_story_id=db_story.id)
-                persisted_criteria.append({'id': criterion.id, 'text': text, 'user_story_id': db_story.id})
-        self.orchestrator.ctx.session.commit()
-        updated['user_stories'] = persisted_stories
-        updated['acceptance_criteria'] = persisted_criteria
+                staged_criteria.append({'text': text, '_story_idx': idx})
+
+        updated['user_stories'] = staged_stories
+        updated['acceptance_criteria'] = staged_criteria
         self._log_node_exit('po_create_user_stories', updated)
         return updated
 
     def po_create_backlog_and_tasks(self, state: WorkflowState) -> WorkflowState:
+        """Stage backlog and tasks in state (no DB persistence yet — deferred to po_review)."""
         self._log_node_enter('po_create_backlog_and_tasks', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
@@ -121,41 +125,198 @@ class WorkflowNodes:
         po_result = updated['po_result']
         backlog_items = po_result['backlog_items']
         tasks = po_result['implementation_tasks']
+
+        # Stage backlog items (NOT persisted to DB yet)
+        staged_backlog: list[dict] = []
+        for idx, backlog_item in enumerate(backlog_items, start=1):
+            staged_backlog.append({'_idx': idx, **backlog_item})
+
+        # Stage tasks (NOT persisted to DB yet)
+        staged_tasks: list[dict] = []
+        for task_idx, task_data in enumerate(tasks):
+            staged_tasks.append({'_task_idx': task_idx, **task_data})
+
+        updated['backlog'] = staged_backlog
+        updated['task_queue'] = staged_tasks
+        updated['status'] = WorkflowStatus.BACKLOG_CREATED.value
+        updated['current_agent'] = AgentName.PO.value
+        # Keep po_result for the review agent — it will be cleared after review
+        self._log_node_exit('po_create_backlog_and_tasks', updated)
+        return updated
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  PO Review Gate (validation before persistence)
+    # ──────────────────────────────────────────────────────────────────────
+
+    def po_review(self, state: WorkflowState) -> WorkflowState:
+        """Validate PO output via the review agent.
+
+        On PASS: persists all stories, backlog items, and tasks to DB.
+        On NEEDS_REVISION: increments retry counter; nothing is persisted.
+        """
+        self._log_node_enter('po_review', state)
+        self._check_cancelled(state['workflow_id'])
+        updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'po_review']
+
+        WorkflowLogger.info("workflow.po_review.started",
+            workflow_id=updated['workflow_id'],
+            message="PO review started"
+        )
+
+        self.orchestrator.update_workflow_status(
+            updated['workflow_id'],
+            WorkflowStatus.PO_REVIEW_IN_PROGRESS.value,
+            AgentName.PO_REVIEW.value,
+            'PO review agent is validating PO output.'
+        )
+
+        po_result = updated.get('po_result') or {}
+
+        # Run the review agent
+        review_result = self.po_review_agent.review(
+            brd_content=updated['brd_content'],
+            feature_summary=updated.get('feature_summary', ''),
+            user_stories=po_result.get('user_stories', []),
+            backlog_items=po_result.get('backlog_items', []),
+            implementation_tasks=po_result.get('implementation_tasks', []),
+        )
+
+        review_dict = review_result.model_dump()
+        updated['po_review_result'] = review_dict
+        updated['current_agent'] = AgentName.PO_REVIEW.value
+
+        # Record the review run in audit trail
+        self.orchestrator.record_agent_run(
+            updated['workflow_id'],
+            AgentName.PO_REVIEW.value,
+            'SUCCESS',
+            input_payload={'brd_id': updated.get('brd_id')},
+            output_payload=review_dict,
+        )
+
+        if review_result.decision == 'PASS':
+            WorkflowLogger.info("workflow.po_review.passed",
+                workflow_id=updated['workflow_id'],
+                message="PO review passed"
+            )
+            # ── Persist all PO artifacts to DB ──
+            updated = self._persist_po_artifacts(updated)
+            updated['status'] = WorkflowStatus.BACKLOG_CREATED.value
+            # Clean up po_result now that everything is persisted
+            updated.pop('po_result', None)
+        else:
+            issues_summary = [f"[{i.get('category', '?')}] {i.get('description', '')}" for i in review_dict.get('issues', [])]
+            WorkflowLogger.warning("workflow.po_review.failed",
+                workflow_id=updated['workflow_id'],
+                issues=issues_summary,
+                message=f"PO review failed with {len(issues_summary)} issues"
+            )
+            updated['po_review_retries'] = updated.get('po_review_retries', 0) + 1
+            updated['status'] = WorkflowStatus.PO_REVIEW_FAILED.value
+
+        self.orchestrator.ctx.session.commit()
+        self._log_node_exit('po_review', updated)
+        return updated
+
+    def _persist_po_artifacts(self, state: dict) -> dict:
+        """Persist all staged PO artifacts (stories, backlog, tasks) to DB.
+
+        Called only when po_review passes. Returns updated state with DB IDs.
+        """
+        workflow_id = state['workflow_id']
+        po_result = state.get('po_result') or {}
+
+        # ── 1. Persist user stories ──────────────────────────────────────
+        persisted_stories: list[dict] = []
+        persisted_criteria: list[dict] = []
+        story_db_map: dict[int, int] = {}  # _idx -> db story id
+
+        for story in po_result.get('user_stories', []):
+            db_story = self.orchestrator.ctx.brd_repo.create_user_story(
+                workflow_id, story['title'], story['description'], story.get('priority', 'MEDIUM')
+            )
+            persisted_stories.append({'id': db_story.id, **story})
+            # Track mapping for criteria
+            story_idx = len(persisted_stories) - 1
+            story_db_map[story_idx] = db_story.id
+            for text in story.get('acceptance_criteria', []):
+                criterion = self.orchestrator.ctx.brd_repo.create_acceptance_criterion(
+                    workflow_id, text, user_story_id=db_story.id
+                )
+                persisted_criteria.append({'id': criterion.id, 'text': text, 'user_story_id': db_story.id})
+
+        state['user_stories'] = persisted_stories
+        state['acceptance_criteria'] = persisted_criteria
+
+        # ── 2. Persist backlog items ─────────────────────────────────────
+        backlog_items = po_result.get('backlog_items', [])
+        tasks = po_result.get('implementation_tasks', [])
         persisted_backlog: list[dict] = []
         persisted_tasks: list[dict] = []
 
-        # Step 1: Create all backlog items first
-        db_backlog_map: list[int] = []  # list of db backlog IDs by index
+        db_backlog_map: list[int] = []
         for idx, backlog_item in enumerate(backlog_items, start=1):
-            db_backlog = self.orchestrator.ctx.task_repo.create_backlog_item(updated['workflow_id'], backlog_item['title'], backlog_item['description'], backlog_item['team'], idx)
+            db_backlog = self.orchestrator.ctx.task_repo.create_backlog_item(
+                workflow_id, backlog_item['title'], backlog_item['description'], backlog_item['team'], idx
+            )
             persisted_backlog.append({'id': db_backlog.id, **backlog_item})
             db_backlog_map.append(db_backlog.id)
 
-        # Step 2: Create tasks, linking each to a backlog item by index.
-        # If there are more tasks than backlog items, extra tasks link to the last backlog item.
+        # ── 3. Persist tasks ─────────────────────────────────────────────
         for task_idx, task_data in enumerate(tasks):
             backlog_id = db_backlog_map[min(task_idx, len(db_backlog_map) - 1)] if db_backlog_map else None
             db_task = self.orchestrator.ctx.task_repo.create_task(
-                workflow_id=updated['workflow_id'],
+                workflow_id=workflow_id,
                 backlog_item_id=backlog_id,
                 title=task_data['title'],
                 description=task_data['description'],
                 assignee_team=task_data['assignee_team'],
-                max_retry=updated['max_retry'],
+                max_retry=state['max_retry'],
                 required_markers=task_data['required_markers'],
                 input_context=task_data['input_context'],
             )
-            for text in task_data['acceptance_criteria']:
-                self.orchestrator.ctx.task_repo.attach_acceptance_criterion(updated['workflow_id'], db_task.id, text)
+            for text in task_data.get('acceptance_criteria', []):
+                self.orchestrator.ctx.task_repo.attach_acceptance_criterion(workflow_id, db_task.id, text)
             persisted_tasks.append(self.orchestrator.serialize_task(db_task.id))
 
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.BACKLOG_CREATED.value, AgentName.PO.value, 'PO agent created backlog and implementation tasks.')
-        updated['backlog'] = persisted_backlog
-        updated['task_queue'] = persisted_tasks
-        updated['status'] = WorkflowStatus.BACKLOG_CREATED.value
-        updated['current_agent'] = AgentName.PO.value
-        updated.pop('po_result', None)
-        self._log_node_exit('po_create_backlog_and_tasks', updated)
+        self.orchestrator.update_workflow_status(
+            workflow_id, WorkflowStatus.BACKLOG_CREATED.value,
+            AgentName.PO.value, 'PO artifacts persisted after review passed.'
+        )
+
+        state['backlog'] = persisted_backlog
+        state['task_queue'] = persisted_tasks
+        return state
+
+    def po_review_failed(self, state: WorkflowState) -> WorkflowState:
+        """Terminal node: PO review exhausted all retries — mark workflow as failed."""
+        self._log_node_enter('po_review_failed', state)
+        updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'po_review_failed']
+
+        review_result = updated.get('po_review_result') or {}
+        issues = review_result.get('issues', [])
+
+        WorkflowLogger.error("workflow.po_review.exhausted",
+            workflow_id=updated['workflow_id'],
+            retries=updated.get('po_review_retries', 0),
+            issues_count=len(issues),
+            message=f"PO review failed with issues after all retries exhausted"
+        )
+
+        self.orchestrator.update_workflow_status(
+            updated['workflow_id'],
+            WorkflowStatus.PO_REVIEW_FAILED.value,
+            AgentName.PO_REVIEW.value,
+            f'PO review failed after {updated.get("po_review_retries", 0)} retries. '
+            f'{len(issues)} unresolved issues. Workflow cannot proceed to DEV.',
+        )
+        self.orchestrator.ctx.session.commit()
+
+        updated['status'] = WorkflowStatus.PO_REVIEW_FAILED.value
+        updated['current_agent'] = AgentName.PO_REVIEW.value
+        self._log_node_exit('po_review_failed', updated)
         return updated
 
     # ──────────────────────────────────────────────────────────────────────

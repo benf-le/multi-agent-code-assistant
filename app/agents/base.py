@@ -45,6 +45,22 @@ class DevResult(BaseModel):
         return self.file_path.split('/')[-1].split('\\')[-1]
 
 
+class POReviewIssue(BaseModel):
+    """A single validation issue found during PO review."""
+    category: str = Field(description="Category of the issue: 'story_format', 'completeness', 'task_clarity', 'duplicate', 'traceability'")
+    severity: str = Field(default='MEDIUM', description="Issue severity: LOW, MEDIUM, HIGH, CRITICAL")
+    description: str = Field(description="Clear description of what is wrong")
+    affected_items: list[str] = Field(default_factory=list, description="Identifiers of affected stories/tasks/backlog items")
+
+
+class POReviewResult(BaseModel):
+    """Structured result from the PO review validation gate."""
+    decision: str = Field(description="Review decision: 'PASS' or 'NEEDS_REVISION'")
+    issues: list[POReviewIssue] = Field(default_factory=list, description="List of validation issues found")
+    suggestions: list[str] = Field(default_factory=list, description="Actionable improvement suggestions")
+    summary: str = Field(default="", description="Brief summary of the review outcome")
+
+
 class QCResult(BaseModel):
     passed: bool
     status: str = Field(default="COMPLETED", description="Status of the validation (e.g., PASSED, FAILED)")

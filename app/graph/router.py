@@ -48,3 +48,49 @@ def route_by_qc_result(state: WorkflowState) -> str:
     ]
 
     return route
+
+
+def route_by_po_review(state: WorkflowState) -> str:
+    """Route after PO review validation within the PO phase graph.
+
+    Returns:
+        'pass'   — review passed, continue to END
+        'retry'  — review failed, retries remain, loop back to po_analyze_brd
+        'fail'   — review failed, retries exhausted, go to po_review_failed
+    """
+    po_review = state.get('po_review_result') or {}
+    decision = po_review.get('decision', 'NEEDS_REVISION')
+    retries = int(state.get('po_review_retries', 0))
+    settings = get_settings()
+    max_retries = settings.po_review_max_retries
+
+    route = 'fail'
+    reason = 'PO review failed with no retries remaining.'
+
+    if decision == 'PASS':
+        route = 'pass'
+        reason = 'PO review passed all validation checks.'
+    elif retries < max_retries:
+        route = 'retry'
+        reason = f'PO review failed (attempt {retries + 1}/{max_retries}), retrying PO phase.'
+    else:
+        reason = f'PO review failed after {retries} retries. Max retries ({max_retries}) exhausted.'
+
+    # Log the decision
+    WorkflowLogger.info("workflow.route.po_review_decision",
+        workflow_id=state.get('workflow_id'),
+        route=route,
+        reason=reason,
+        decision=decision,
+        retries=retries,
+        max_retries=max_retries,
+        issues_count=len(po_review.get('issues', []))
+    )
+
+    # Update trace
+    state['route_decisions'] = [
+        *state.get('route_decisions', []),
+        {'node': 'po_review', 'route': route, 'reason': reason}
+    ]
+
+    return route

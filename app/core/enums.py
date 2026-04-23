@@ -5,6 +5,8 @@ class WorkflowStatus(str, Enum):
     NEW = 'NEW'
     PO_ANALYZING = 'PO_ANALYZING'
     BACKLOG_CREATED = 'BACKLOG_CREATED'
+    PO_REVIEW_IN_PROGRESS = 'PO_REVIEW_IN_PROGRESS'
+    PO_REVIEW_FAILED = 'PO_REVIEW_FAILED'
     TASK_READY_FOR_DEV = 'TASK_READY_FOR_DEV'
     DEV_IN_PROGRESS = 'DEV_IN_PROGRESS'
     DEV_DONE = 'DEV_DONE'
@@ -22,6 +24,7 @@ class WorkflowStatus(str, Enum):
 class AgentName(str, Enum):
     ORCHESTRATOR = 'ORCHESTRATOR'
     PO = 'PO'
+    PO_REVIEW = 'PO_REVIEW'
     DEV = 'DEV'
     QC = 'QC'
 

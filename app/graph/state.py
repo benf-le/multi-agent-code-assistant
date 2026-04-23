@@ -10,6 +10,8 @@ class WorkflowState(TypedDict, total=False):
     acceptance_criteria: list[dict[str, Any]]
     backlog: list[dict[str, Any]]
     po_result: dict[str, Any]
+    po_review_result: dict[str, Any] | None
+    po_review_retries: int
     current_task: dict[str, Any] | None
     task_queue: list[dict[str, Any]]
     task_history: list[dict[str, Any]]

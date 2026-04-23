@@ -1,6 +1,6 @@
 import json
 from langchain_openai import ChatOpenAI
-from app.agents.base import POResult, DevResult, QCResult
+from app.agents.base import POResult, POReviewResult, DevResult, QCResult
 
 
 def to_pretty_json(data) -> str:
@@ -83,6 +83,114 @@ Analyze the following BRD and return the structured result.
 <BRD>
 {brd_content}
 </BRD>
+                """.strip(),
+            ),
+        ]
+        return structured_llm.invoke(messages)
+
+
+class POReviewAgent(OpenAIAPIAgent):
+    """PO Review agent — validates PO output before tasks go to DEV.
+
+    Acts as a quality gate between the PO phase and task execution,
+    checking user story format, BRD completeness, task clarity, and
+    traceability.
+    """
+    def review(
+        self,
+        brd_content: str,
+        feature_summary: str,
+        user_stories: list[dict],
+        backlog_items: list[dict],
+        implementation_tasks: list[dict],
+    ) -> POReviewResult:
+        structured_llm = self.llm.with_structured_output(
+            POReviewResult,
+            method="function_calling",
+        )
+
+        brd_json = to_pretty_json(brd_content)
+        stories_json = to_pretty_json(user_stories or [])
+        backlog_json = to_pretty_json(backlog_items or [])
+        tasks_json = to_pretty_json(implementation_tasks or [])
+
+        messages = [
+            (
+                "system",
+                """
+You are a senior Product Owner reviewer performing a quality gate on PO-generated artifacts.
+
+Your job is to validate the PO output BEFORE it is sent downstream to engineering (DEV/QC agents).
+
+You must check the following dimensions:
+
+1. **User Story Format**
+   - Each user story description should preferably follow the pattern: "As a ..., I want ..., so that ..."
+   - Minor wording variations are acceptable as long as the story clearly includes:
+     - an actor / role
+     - a goal / need
+     - a business or operational value / outcome
+   - Technical or enabler stories may use internal actors such as backend engineer, platform engineer, QA engineer, operations team, or administrator.
+   - Only report a 'story_format' issue if a story is missing one or more core elements (actor, goal, or value), or if it is merely a title/label rather than a complete story.
+
+2. **Completeness vs BRD**
+   - Every requirement stated or implied in the BRD must be covered by at least one user story.
+   - If a BRD requirement is missing from the stories, report it as a 'completeness' issue.
+
+3. **Task Clarity and Duplicates**
+   - Each implementation task must have a clear, actionable description.
+   - No two tasks should overlap significantly in scope.
+   - If a task is vague or duplicated, report it as a 'task_clarity' or 'duplicate' issue.
+
+4. **Traceability (Task → Story)**
+   - Every implementation task should be traceable to at least one user story.
+   - If a task cannot be linked to any story, report it as a 'traceability' issue.
+
+Decision rules:
+- If there are NO issues: decision = "PASS"
+- If there are ANY issues: decision = "NEEDS_REVISION"
+- Be strict but fair — do not invent problems that don't exist.
+- Provide actionable suggestions for every issue.
+
+Negative constraints:
+- Do not expand scope beyond the BRD.
+- Do not invent new requirements.
+- Do not suggest new stories or tasks — only validate existing ones.
+- Do not give vague feedback. Every issue must cite specific items.
+
+Return only the structured output matching the schema.
+                """.strip(),
+            ),
+            (
+                "human",
+                f"""
+Review the following PO output for quality.
+
+Instructions:
+- Base your review only on the provided artifacts.
+- Do not assume missing context.
+- If evidence is insufficient, say so in the issue reason.
+- Return only the structured output.
+
+<BRD>
+{brd_json}
+</BRD>
+
+<FEATURE_SUMMARY>
+{feature_summary}
+</FEATURE_SUMMARY>
+
+<USER_STORIES>
+{stories_json}
+</USER_STORIES>
+
+<BACKLOG_ITEMS>
+{backlog_json}
+</BACKLOG_ITEMS>
+
+<IMPLEMENTATION_TASKS>
+{tasks_json}
+</IMPLEMENTATION_TASKS>
                 """.strip(),
             ),
         ]

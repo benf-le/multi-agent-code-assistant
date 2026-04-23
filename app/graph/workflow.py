@@ -1,7 +1,7 @@
 from langgraph.graph import END, START, StateGraph
 
 from app.graph.nodes import WorkflowNodes
-from app.graph.router import route_by_qc_result
+from app.graph.router import route_by_qc_result, route_by_po_review
 from app.graph.state import WorkflowState
 from app.core.logging_helper import WorkflowLogger
 
@@ -9,9 +9,13 @@ from app.core.logging_helper import WorkflowLogger
 class WorkflowGraphFactory:
     """Builds two separate LangGraph graphs:
 
-    1. **PO Phase graph** — linear pipeline, no cycles:
+    1. **PO Phase graph** — pipeline with review gate:
        START → ingest_brd → orchestrator_init → po_analyze_brd
-             → po_create_user_stories → po_create_backlog_and_tasks → END
+             → po_create_user_stories → po_create_backlog_and_tasks
+             → po_review
+             ├─ pass  → END
+             ├─ retry → po_analyze_brd  (bounded cycle)
+             └─ fail  → po_review_failed → END
 
     2. **Task graph** — single-task lifecycle with bounded retry cycle:
        START → dispatch_to_dev → dev_implement → dispatch_to_qc → qc_validate
@@ -25,21 +29,44 @@ class WorkflowGraphFactory:
         self.nodes = nodes
 
     def build_po_graph(self):
-        """Build the PO analysis phase graph (linear, no cycles)."""
+        """Build the PO analysis phase graph with review gate.
+
+        Flow:
+        START → ingest_brd → orchestrator_init → po_analyze_brd
+              → po_create_user_stories → po_create_backlog_and_tasks
+              → po_review
+              ├─ pass  → END
+              ├─ retry → po_analyze_brd  (bounded cycle)
+              └─ fail  → po_review_failed → END
+        """
         graph = StateGraph(WorkflowState)
         graph.add_node('ingest_brd', self.nodes.ingest_brd)
         graph.add_node('orchestrator_init', self.nodes.orchestrator_init)
         graph.add_node('po_analyze_brd', self.nodes.po_analyze_brd)
         graph.add_node('po_create_user_stories', self.nodes.po_create_user_stories)
         graph.add_node('po_create_backlog_and_tasks', self.nodes.po_create_backlog_and_tasks)
+        graph.add_node('po_review', self.nodes.po_review)
+        graph.add_node('po_review_failed', self.nodes.po_review_failed)
 
         graph.add_edge(START, 'ingest_brd')
         graph.add_edge('ingest_brd', 'orchestrator_init')
         graph.add_edge('orchestrator_init', 'po_analyze_brd')
         graph.add_edge('po_analyze_brd', 'po_create_user_stories')
         graph.add_edge('po_create_user_stories', 'po_create_backlog_and_tasks')
-        graph.add_edge('po_create_backlog_and_tasks', END)
-        
+        graph.add_edge('po_create_backlog_and_tasks', 'po_review')
+
+        # Conditional routing from po_review
+        graph.add_conditional_edges(
+            'po_review',
+            route_by_po_review,
+            {
+                'pass': END,
+                'retry': 'po_analyze_brd',
+                'fail': 'po_review_failed',
+            },
+        )
+        graph.add_edge('po_review_failed', END)
+
         compiled = graph.compile()
         self._log_topology("po_graph", compiled)
         return compiled

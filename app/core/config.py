@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     graph_recursion_limit: int = Field(default=50, alias='GRAPH_RECURSION_LIMIT')
     # Max identical loop signatures before force-blocking a task
     max_loop_signatures: int = Field(default=3, alias='MAX_LOOP_SIGNATURES')
+    # Max retry attempts for PO review failures before marking workflow as FAILED.
+    # Set to 0 to fail immediately on first NEEDS_REVISION.
+    po_review_max_retries: int = Field(default=3, alias='PO_REVIEW_MAX_RETRIES')
 
 
 @lru_cache

@@ -3,7 +3,7 @@ from typing import Callable
 
 from sqlalchemy.orm import Session
 
-from app.agents.openai_agents import POAgent, DevAgent, QCAgent
+from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent
 from app.core.config import get_settings
 from app.core.enums import AgentName, WorkflowStatus, TaskStatus
 from app.graph.nodes import WorkflowNodes
@@ -24,6 +24,7 @@ _TERMINAL_WORKFLOW_STATUSES = frozenset({
     WorkflowStatus.DONE.value,
     WorkflowStatus.BLOCKED.value,
     WorkflowStatus.CANCELLED.value,
+    WorkflowStatus.PO_REVIEW_FAILED.value,
 })
 
 _RUNNABLE_TASK_STATUSES = frozenset({
@@ -44,7 +45,7 @@ class WorkflowService:
     """Orchestrates multi-task workflows using a 1-task-per-graph-run design.
 
     Architecture:
-    - PO phase: single linear graph run (no cycles)
+    - PO phase: graph run with review gate (po_review validates before persistence)
     - Task phase: service-level loop, each iteration invokes a bounded
       single-task graph (DEV→QC retry cycle only)
     - DB is source of truth between graph runs
@@ -72,13 +73,14 @@ class WorkflowService:
             raise ValueError("OPENAI_API_KEY is not set in environment. Real agents are required.")
         return (
             POAgent(self.settings.openai_api_key),
+            POReviewAgent(self.settings.openai_api_key),
             DevAgent(self.settings.openai_api_key),
             QCAgent(self.settings.openai_api_key),
         )
 
     def _build_graph_factory(self, orchestrator: OrchestratorService) -> WorkflowGraphFactory:
-        po, dev, qc = self._build_agents()
-        nodes = WorkflowNodes(orchestrator, po, dev, qc)
+        po, po_review, dev, qc = self._build_agents()
+        nodes = WorkflowNodes(orchestrator, po, po_review, dev, qc)
         return WorkflowGraphFactory(nodes)
 
     def _graph_config(self) -> dict:
@@ -175,6 +177,8 @@ class WorkflowService:
             'user_stories': [],
             'acceptance_criteria': [],
             'backlog': [],
+            'po_review_result': None,
+            'po_review_retries': 0,
             'current_task': None,
             'task_queue': [],
             'task_history': [],
@@ -254,6 +258,12 @@ class WorkflowService:
                 graph_name="po_graph",
                 visited_nodes=result.get("visited_nodes", [])
             )
+
+            # Check if PO review failed — abort before task phase
+            if result.get('status') == WorkflowStatus.PO_REVIEW_FAILED.value:
+                logger.warning('PO review failed for workflow %s — aborting before task phase', workflow.id)
+                return result
+
             logger.info('PO phase completed for workflow %s', workflow.id)
             return result
         except Exception as e:
@@ -397,9 +407,18 @@ class WorkflowService:
                 existing_tasks = orchestrator.ctx.task_repo.list_tasks(workflow_id)
                 if not existing_tasks:
                     if workflow.status in (WorkflowStatus.NEW.value, WorkflowStatus.PO_ANALYZING.value):
-                        self._run_po_phase(session, orchestrator, workflow, brd)
+                        po_result = self._run_po_phase(session, orchestrator, workflow, brd)
                         # Refresh workflow after PO phase
                         session.refresh(workflow)
+                        # Abort if PO review failed — do NOT proceed to task phase
+                        if workflow.status == WorkflowStatus.PO_REVIEW_FAILED.value:
+                            logger.warning('Workflow %s aborted — PO review failed', workflow_id)
+                            return {
+                                'workflow_id': workflow_id,
+                                'status': WorkflowStatus.PO_REVIEW_FAILED.value,
+                                'po_review_result': po_result.get('po_review_result'),
+                                'final_status': WorkflowStatus.PO_REVIEW_FAILED.value,
+                            }
                     else:
                         logger.info('Skipping PO phase — workflow %s already at status %s', workflow_id, workflow.status)
 
@@ -450,7 +469,7 @@ class WorkflowService:
                 session.refresh(workflow)
 
             # Handle terminal states
-            if workflow.status in (WorkflowStatus.DONE.value, WorkflowStatus.BLOCKED.value):
+            if workflow.status in (WorkflowStatus.DONE.value, WorkflowStatus.BLOCKED.value, WorkflowStatus.PO_REVIEW_FAILED.value):
                 logger.info('Workflow %s is already in terminal state %s', workflow_id, workflow.status)
                 return {'workflow_id': workflow_id, 'status': workflow.status, 'message': 'Workflow already completed.'}
 
@@ -465,8 +484,17 @@ class WorkflowService:
                 existing_tasks = orchestrator.ctx.task_repo.list_tasks(workflow_id)
                 if not existing_tasks:
                     # PO phase not complete — re-run it
-                    self._run_po_phase(session, orchestrator, workflow, brd)
+                    po_result = self._run_po_phase(session, orchestrator, workflow, brd)
                     session.refresh(workflow)
+                    # Abort if PO review failed
+                    if workflow.status == WorkflowStatus.PO_REVIEW_FAILED.value:
+                        logger.warning('Workflow %s resume aborted — PO review failed', workflow_id)
+                        return {
+                            'workflow_id': workflow_id,
+                            'status': WorkflowStatus.PO_REVIEW_FAILED.value,
+                            'po_review_result': po_result.get('po_review_result'),
+                            'final_status': WorkflowStatus.PO_REVIEW_FAILED.value,
+                        }
 
                 # Run task loop from current state
                 result = self._run_task_loop(session, orchestrator, workflow, brd)
