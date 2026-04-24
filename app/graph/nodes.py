@@ -3,6 +3,7 @@ from copy import deepcopy
 import os
 from pathlib import Path
 
+from app.agents.base import DevResult
 from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent
 from app.core.enums import AgentName, TaskStatus, WorkflowStatus
 from app.graph.state import WorkflowState
@@ -376,48 +377,44 @@ class WorkflowNodes:
         self._log_node_exit('dev_implement', updated)
         return updated
 
-    def _save_physical_files(self, workflow_id: int, task: dict, dev_result):
+    def _save_physical_files(self, workflow_id: int, task: dict, dev_result: DevResult):
         """Save all task outputs into a single unified project directory.
         
         All files are written to generated_code/wf_{id}/project/ using the
-        file_path returned by the LLM (e.g. 'app/api/admin.py').  Unit tests
-        are placed under tests/ and implementation notes under docs/.
+        file_path returned by the LLM.
         """
         try:
             project_dir = Path("generated_code") / f"wf_{workflow_id}" / "project"
 
-            # ── 1. Main source file ──────────────────────────────────────────
-            # file_path is something like 'app/api/admin.py'
-            # Make sure it doesn't escape the project dir (basic sanitize)
-            raw_path = dev_result.file_path.lstrip("/\\").replace("..", "")
-            dest_file = project_dir / raw_path
-            dest_file.parent.mkdir(parents=True, exist_ok=True)
-            dest_file.write_text(dev_result.code, encoding="utf-8")
+            # ── 1. Save implementation files ──────────────────────────────────
+            for imp_file in dev_result.files:
+                # Basic sanitize: remove leading slash/backslash and '..'
+                raw_path = imp_file.file_path.lstrip("/\\").replace("..", "")
+                dest_file = project_dir / raw_path
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                dest_file.write_text(imp_file.code, encoding="utf-8")
+                print(f"[wf_{workflow_id}] Saved file: {raw_path}")
 
-            # ── 2. Unit tests ────────────────────────────────────────────────
-            if dev_result.unit_tests:
-                # Mirror the source path under tests/, e.g.
-                #   app/api/admin.py  →  tests/app/api/test_admin.py
-                parts = Path(raw_path).parts          # ('app', 'api', 'admin.py')
-                stem = Path(parts[-1]).stem            # 'admin'
-                suffix = Path(parts[-1]).suffix        # '.py'
-                test_rel = Path("tests").joinpath(*parts[:-1]) / f"test_{stem}{suffix}"
-                test_file = project_dir / test_rel
-                test_file.parent.mkdir(parents=True, exist_ok=True)
-                test_file.write_text(dev_result.unit_tests, encoding="utf-8")
+            # ── 2. Save unit tests ────────────────────────────────────────────
+            for test_file_obj in dev_result.unit_tests:
+                raw_path = test_file_obj.file_path.lstrip("/\\").replace("..", "")
+                dest_file = project_dir / raw_path
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                dest_file.write_text(test_file_obj.code, encoding="utf-8")
+                print(f"[wf_{workflow_id}] Saved test: {raw_path}")
 
             # ── 3. Implementation notes ──────────────────────────────────────
             if dev_result.implementation_notes:
-                notes_rel = Path("docs") / f"{Path(raw_path).stem}_notes.md"
+                # Create a generic name for notes based on task number
+                notes_rel = Path("docs") / f"task_{task['task_number']:03d}_notes.md"
                 notes_file = project_dir / notes_rel
                 notes_file.parent.mkdir(parents=True, exist_ok=True)
                 header = (
                     f"# Task t-{task['task_number']:03d}: {task.get('title', '')}\n\n"
-                    f"**Source file:** `{raw_path}`\n\n"
+                    f"**Task ID:** `{task.get('task_id', 'N/A')}`\n\n"
                 )
                 notes_file.write_text(header + dev_result.implementation_notes, encoding="utf-8")
 
-            print(f"[wf_{workflow_id}] Saved '{raw_path}' → project/")
         except Exception as e:
             print(f"[wf_{workflow_id}] Error saving physical files: {e}")
 

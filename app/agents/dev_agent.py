@@ -1,4 +1,4 @@
-from app.agents.base import DevResult
+from app.agents.base import DevResult, ImplementedFile, TestFile
 
 
 class MockDevAgent:
@@ -26,9 +26,25 @@ class MockDevAgent:
             *[f"        '{marker}': True," for marker in included_markers],
             '    }',
         ])
-        unit_tests = '\n'.join([
+        unit_tests_code = '\n'.join([
             'def test_generated_feature():',
             '    result = generated_feature()',
             *[f"    assert result['{marker}'] is True" for marker in included_markers],
         ])
-        return DevResult(code=code, unit_tests=unit_tests, implementation_notes=note + extra, included_markers=included_markers)
+
+        # Create nested objects
+        files = [
+            ImplementedFile(file_path="app/generated_feature.py", code=code)
+        ]
+        unit_tests = [
+            TestFile(file_path="tests/test_generated_feature.py", code=unit_tests_code)
+        ]
+
+        return DevResult(
+            task_id=task.get('task_id', 'TASK-001'),
+            files=files,
+            unit_tests=unit_tests,
+            implementation_notes=note + extra,
+            included_markers=included_markers,
+            known_limitations=[]
+        )
