@@ -116,7 +116,7 @@ class StrictArtifactModel(BaseModel):
     """
 
     model_config = {
-        "extra": "forbid",
+        "extra": "ignore",
         "str_strip_whitespace": True,
         "validate_assignment": True,
     }
@@ -194,6 +194,14 @@ class BacklogItemOut(StrictArtifactModel):
         default_factory=list,
         description="Assumptions relevant to this backlog item."
     )
+    acceptance_criteria: list[str] = Field(
+        default_factory=list,
+        description="Optional high-level acceptance criteria for this backlog item."
+    )
+    source_references: list[str] = Field(
+        default_factory=list,
+        description="Optional references to BRD sections supporting this backlog item."
+    )
 
     @field_validator("backlog_item_id")
     @classmethod
@@ -217,10 +225,10 @@ class BacklogItemOut(StrictArtifactModel):
             raise ValueError(f"invalid related_user_story_ids: {invalid}")
         return values
 
-    @field_validator("assumptions")
+    @field_validator("assumptions", "acceptance_criteria", "source_references")
     @classmethod
-    def validate_assumptions(cls, values: list[str]) -> list[str]:
-        return _clean_string_list(values, "assumptions")
+    def validate_string_lists(cls, values: list[str]) -> list[str]:
+        return _clean_string_list(values)
 
 
 class TaskOut(StrictArtifactModel):
@@ -318,6 +326,10 @@ class POResult(StrictArtifactModel):
     user_stories: list[StoryOut] = Field(default_factory=list)
     backlog_items: list[BacklogItemOut] = Field(default_factory=list)
     implementation_tasks: list[TaskOut] = Field(default_factory=list)
+    resolution_map: dict[str, str] = Field(
+        default_factory=dict,
+        description="Mapping of review issue_id or category to resolution description."
+    )
 
     @field_validator("feature_summary")
     @classmethod

@@ -12,6 +12,11 @@ def invoke_structured_with_retry(structured_llm, messages, max_attempts: int = 2
             return structured_llm.invoke(messages)
         except ValidationError as exc:
             last_error = exc
+            # Truncate very long validation errors to avoid overwhelming the context
+            exc_str = str(exc)
+            if len(exc_str) > 2000:
+                exc_str = exc_str[:2000] + "\n... [truncated]"
+
             messages = messages + [
                 (
                     "human",
@@ -19,9 +24,10 @@ def invoke_structured_with_retry(structured_llm, messages, max_attempts: int = 2
 Your previous response did not match the required schema.
 
 Validation errors:
-{str(exc)}
+{exc_str}
 
 Return the complete corrected structured output.
+Ensure the JSON structure is FLAT as defined: user_stories, backlog_items, and implementation_tasks MUST be top-level lists in the POResult object. Do NOT nest implementation_tasks inside backlog_items.
 
 Universal schema rules:
 - Return only fields defined by the schema.
@@ -84,17 +90,36 @@ def to_pretty_json(data) -> str:
 
 class OpenAIAPIAgent:
     """Base class for OpenAI-powered agents."""
-    def __init__(self, api_key: str, model: str = "gpt-5-nano"):
+    def __init__(self, api_key: str, model: str = "gpt-5-mini"):
         self.llm = ChatOpenAI(model=model, api_key=api_key, temperature=0)
 
 
 class POAgent(OpenAIAPIAgent):
     """Product Owner agent responsible for BRD analysis and task breakdown."""
-    def analyze(self, brd_content: str) -> POResult:
+    def analyze(
+        self,
+        brd_content: str,
+        previous_result: dict | None = None,
+        review_issues: list[dict] | None = None
+    ) -> POResult:
         structured_llm = self.llm.with_structured_output(
             POResult,
             method="function_calling",
         )
+
+        feedback_block = ""
+        if review_issues:
+            feedback_block = "\n### REVISION FEEDBACK\n"
+            feedback_block += "You are in REVISION MODE. The following issues were found in your previous output. You MUST address each one:\n"
+            for idx, issue in enumerate(review_issues, 1):
+                feedback_block += f"{idx}. [{issue.get('category')}] (Severity: {issue.get('severity')}): {issue.get('description')}\n"
+                feedback_block += f"   Affected items: {', '.join(issue.get('affected_items', []))}\n"
+                feedback_block += f"   Suggestion: {issue.get('suggestion')}\n"
+
+        previous_artifacts_block = ""
+        if previous_result:
+            previous_artifacts_block = "\n### PREVIOUS ARTIFACTS\n"
+            previous_artifacts_block += to_pretty_json(previous_result)
 
         messages = [
             (
@@ -127,11 +152,17 @@ Schema compliance rules:
   product, backend, frontend, fullstack, mobile, data, devops, platform, qa, security, design, unknown.
 - If the responsible team is unclear, use "unknown".
 
-Required POResult fields:
+Required POResult fields (MUST be top-level lists, NOT nested):
 1. feature_summary
 2. user_stories
 3. backlog_items
 4. implementation_tasks
+
+Hierarchy rules:
+- user_stories, backlog_items, and implementation_tasks MUST be separate flat lists at the root of the JSON object.
+- Do NOT nest implementation_tasks inside backlog_items.
+- Do NOT nest backlog_items inside user_stories.
+- Cross-reference using IDs only (US-001, BL-001, TASK-001).
 
 Domain-aware decomposition:
 - Identify all delivery domains explicitly or strongly indicated by the BRD.

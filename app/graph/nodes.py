@@ -84,7 +84,18 @@ class WorkflowNodes:
         updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'po_analyze_brd']
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.PO_ANALYZING.value, AgentName.PO.value, 'PO agent is analyzing BRD.')
         self._check_cancelled(updated['workflow_id'])
-        result = self.po_agent.analyze(updated['brd_content'])
+        
+        # Extract feedback if this is a retry
+        review_result = updated.get('po_review_result') or {}
+        review_issues = review_result.get('issues', [])
+        previous_po_result = updated.get('po_result')
+
+        self.orchestrator.ctx.session.commit() # End transaction before long LLM call
+        result = self.po_agent.analyze(
+            brd_content=updated['brd_content'],
+            previous_result=previous_po_result,
+            review_issues=review_issues
+        )
         self.orchestrator.ctx.brd_repo.create_feature(updated['workflow_id'], result.feature_summary)
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.PO.value, 'SUCCESS', input_payload={'brd_id': updated['brd_id']}, output_payload=result.model_dump())
         self.orchestrator.ctx.session.commit()
@@ -175,6 +186,7 @@ class WorkflowNodes:
         po_result = updated.get('po_result') or {}
 
         # Run the review agent
+        self.orchestrator.ctx.session.commit() # End transaction before long LLM call
         review_result = self.po_review_agent.review(
             brd_content=updated['brd_content'],
             feature_summary=updated.get('feature_summary', ''),
@@ -352,6 +364,7 @@ class WorkflowNodes:
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV started implementation for {task_display}.")
         self._check_cancelled(updated['workflow_id'])
         bug_reports = self.orchestrator.ctx.task_repo.list_bugs_for_task(current_task['id'])
+        self.orchestrator.ctx.session.commit() # End transaction before long LLM call
         dev_result = self.dev_agent.implement(
             task=current_task,
             acceptance_criteria=current_task['acceptance_criteria'],
@@ -439,6 +452,7 @@ class WorkflowNodes:
         updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'qc_validate']
         current_task = updated['current_task']
         self._check_cancelled(updated['workflow_id'])
+        self.orchestrator.ctx.session.commit() # End transaction before long LLM call
         qc_result = self.qc_agent.validate(current_task, current_task['acceptance_criteria'], updated['dev_output'] or {})
         task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.QC.value, 'SUCCESS', task_id=current_task['id'], input_payload={'task': current_task, 'dev_output': updated.get('dev_output')}, output_payload=qc_result.model_dump())

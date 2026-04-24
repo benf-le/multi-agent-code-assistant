@@ -245,29 +245,31 @@ class WorkflowService:
         graph_factory = self._build_graph_factory(orchestrator)
         po_graph = graph_factory.build_po_graph()
         state = self._build_po_state(workflow, brd)
+        workflow_id = workflow.id
 
         try:
             WorkflowLogger.info("workflow.graph.start", 
-                workflow_id=workflow.id, 
+                workflow_id=workflow_id, 
                 graph_name="po_graph",
                 recursion_limit=self._graph_config().get("recursion_limit")
             )
+            session.commit() # End transaction before long-running graph invocation
             result = po_graph.invoke(state, config=self._graph_config())
             WorkflowLogger.info("workflow.graph.end", 
-                workflow_id=workflow.id, 
+                workflow_id=workflow_id, 
                 graph_name="po_graph",
                 visited_nodes=result.get("visited_nodes", [])
             )
 
             # Check if PO review failed — abort before task phase
             if result.get('status') == WorkflowStatus.PO_REVIEW_FAILED.value:
-                logger.warning('PO review failed for workflow %s — aborting before task phase', workflow.id)
+                logger.warning('PO review failed for workflow %s — aborting before task phase', workflow_id)
                 return result
 
-            logger.info('PO phase completed for workflow %s', workflow.id)
+            logger.info('PO phase completed for workflow %s', workflow_id)
             return result
         except Exception as e:
-            self._handle_graph_error(orchestrator, workflow.id, None, e, phase='po_phase')
+            self._handle_graph_error(orchestrator, workflow_id, None, e, phase='po_phase')
             raise
 
     # ──────────────────────────────────────────────────────────────────────
@@ -286,20 +288,23 @@ class WorkflowService:
         graph_factory = self._build_graph_factory(orchestrator)
         task_graph = graph_factory.build_task_graph()
         state = self._build_task_state(orchestrator, workflow, brd, task_dict)
+        workflow_id = workflow.id
+        task_id = task_dict['id']
 
         try:
             config = self._graph_config()
             WorkflowLogger.info("workflow.graph.start", 
-                workflow_id=workflow.id, 
-                task_id=task_dict['id'],
+                workflow_id=workflow_id, 
+                task_id=task_id,
                 task_number=task_dict['task_number'],
                 graph_name="task_graph",
                 recursion_limit=config.get("recursion_limit")
             )
+            session.commit() # End transaction before long-running graph invocation
             result = task_graph.invoke(state, config=config)
             WorkflowLogger.info("workflow.graph.end", 
-                workflow_id=workflow.id, 
-                task_id=task_dict['id'],
+                workflow_id=workflow_id, 
+                task_id=task_id,
                 graph_name="task_graph",
                 status=result.get('status'),
                 visited_nodes=result.get("visited_nodes", [])
@@ -310,10 +315,10 @@ class WorkflowService:
             logger.info('Task %s interrupted (workflow cancelled)', task_display)
             raise
         except Exception as e:
-            self._handle_graph_error(orchestrator, workflow.id, task_dict['id'], e, phase=f'task_{task_display}')
+            self._handle_graph_error(orchestrator, workflow_id, task_id, e, phase=f'task_{task_display}')
             # Return a synthetic "blocked" result so the service loop can continue
             return {
-                'workflow_id': workflow.id,
+                'workflow_id': workflow_id,
                 'current_task': None,
                 'status': WorkflowStatus.MAX_RETRY_EXCEEDED.value,
                 'error': str(e),
@@ -334,6 +339,12 @@ class WorkflowService:
         """
         from langgraph.errors import GraphRecursionError
 
+        # 1. Rollback the current session immediately to allow new transactions
+        try:
+            orchestrator.ctx.session.rollback()
+        except Exception as rb_error:
+            logger.error('Failed to rollback session for workflow %s: %s', workflow_id, rb_error)
+
         error_type = type(error).__name__
         error_msg = str(error)
 
@@ -342,9 +353,13 @@ class WorkflowService:
         else:
             logger.error('Unexpected error in %s for workflow %s (task_id=%s): %s: %s', phase, workflow_id, task_id, error_type, error_msg)
 
+        # 2. Use a NEW session for audit/status updates if the previous one is corrupted
+        # Since orchestrator.update_* calls commit(), it will start a new transaction 
+        # on the same session if the session is still valid after rollback.
         try:
             # Mark task as BLOCKED if applicable
             if task_id is not None:
+                # We use the repo directly with the existing session (which was just rolled back)
                 task = orchestrator.ctx.task_repo.get_task(task_id)
                 if task and task.status not in (TaskStatus.DONE.value, TaskStatus.BLOCKED.value):
                     orchestrator.update_task_status(
@@ -360,7 +375,7 @@ class WorkflowService:
                 error_message=f'[{phase}] {error_type}: {error_msg[:500]}',
             )
 
-            # Update workflow status to indicate error (but don't mark finished yet)
+            # Update workflow status to indicate error
             orchestrator.update_workflow_status(
                 workflow_id, WorkflowStatus.MAX_RETRY_EXCEEDED.value,
                 AgentName.ORCHESTRATOR.value,
