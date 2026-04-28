@@ -87,10 +87,47 @@ def route_by_po_review(state: WorkflowState) -> str:
         issues_count=len(po_review.get('issues', []))
     )
 
+    return route
+
+
+def route_by_po_local_validate(state: WorkflowState) -> str:
+    """Route after PO local rule-based validation.
+
+    Returns:
+        'pass'   — local validation passed, continue to po_review
+        'retry'  — local validation failed, retries remain, loop back to po_analyze_brd
+        'fail'   — local validation failed, retries exhausted, go to po_review_failed
+    """
+    local_issues = state.get('po_local_issues', [])
+    retries = int(state.get('po_review_retries', 0))
+    settings = get_settings()
+    max_retries = settings.po_review_max_retries
+
+    route = 'pass'
+    reason = 'PO local validation passed all rule-based checks.'
+
+    if local_issues:
+        if retries < max_retries:
+            route = 'retry'
+            reason = f'PO local validation failed (attempt {retries}/{max_retries}), retrying PO phase.'
+        else:
+            route = 'fail'
+            reason = f'PO local validation failed after {retries} retries. Max retries ({max_retries}) exhausted.'
+
+    # Log the decision
+    WorkflowLogger.info("workflow.route.po_local_decision",
+        workflow_id=state.get('workflow_id'),
+        route=route,
+        reason=reason,
+        retries=retries,
+        max_retries=max_retries,
+        issues_count=len(local_issues)
+    )
+
     # Update trace
     state['route_decisions'] = [
         *state.get('route_decisions', []),
-        {'node': 'po_review', 'route': route, 'reason': reason}
+        {'node': 'po_local_validate', 'route': route, 'reason': reason}
     ]
 
     return route

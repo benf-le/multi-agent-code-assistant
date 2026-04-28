@@ -34,10 +34,14 @@ class WorkflowGraphFactory:
         Flow:
         START → ingest_brd → orchestrator_init → po_analyze_brd
               → po_create_user_stories → po_create_backlog_and_tasks
-              → po_review
+              → po_local_validate
+              ├─ pass  → po_review
+              ├─ retry → po_analyze_brd
+              └─ fail  → po_review_failed
+        po_review
               ├─ pass  → END
-              ├─ retry → po_analyze_brd  (bounded cycle)
-              └─ fail  → po_review_failed → END
+              ├─ retry → po_analyze_brd
+              └─ fail  → po_review_failed
         """
         graph = StateGraph(WorkflowState)
         graph.add_node('ingest_brd', self.nodes.ingest_brd)
@@ -45,6 +49,7 @@ class WorkflowGraphFactory:
         graph.add_node('po_analyze_brd', self.nodes.po_analyze_brd)
         graph.add_node('po_create_user_stories', self.nodes.po_create_user_stories)
         graph.add_node('po_create_backlog_and_tasks', self.nodes.po_create_backlog_and_tasks)
+        graph.add_node('po_local_validate', self.nodes.po_local_validate)
         graph.add_node('po_review', self.nodes.po_review)
         graph.add_node('po_review_failed', self.nodes.po_review_failed)
 
@@ -53,7 +58,19 @@ class WorkflowGraphFactory:
         graph.add_edge('orchestrator_init', 'po_analyze_brd')
         graph.add_edge('po_analyze_brd', 'po_create_user_stories')
         graph.add_edge('po_create_user_stories', 'po_create_backlog_and_tasks')
-        graph.add_edge('po_create_backlog_and_tasks', 'po_review')
+        graph.add_edge('po_create_backlog_and_tasks', 'po_local_validate')
+
+        # Conditional routing from po_local_validate
+        from app.graph.router import route_by_po_local_validate
+        graph.add_conditional_edges(
+            'po_local_validate',
+            route_by_po_local_validate,
+            {
+                'pass': 'po_review',
+                'retry': 'po_analyze_brd',
+                'fail': 'po_review_failed',
+            },
+        )
 
         # Conditional routing from po_review
         graph.add_conditional_edges(

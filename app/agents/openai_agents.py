@@ -1,18 +1,28 @@
 import json
+from typing import Any
 from langchain_openai import ChatOpenAI
-from app.agents.base import POResult, POReviewResult, DevResult, QCResult
+from app.agents.base import POResult, POReviewResult, DevResult, QCResult, GENERIC_MARKERS_BLACKLIST
 from pydantic import ValidationError
 
+# ============================================================
+# Shared helpers
+# ============================================================
 
 def invoke_structured_with_retry(structured_llm, messages, max_attempts: int = 2):
+    """
+    Invoke a structured LLM with a schema-repair retry.
+
+    This retry is only for structured output / schema errors.
+    It should not be confused with business-level PO review retry.
+    """
     last_error: Exception | None = None
 
     for _ in range(max_attempts):
         try:
             return structured_llm.invoke(messages)
-        except ValidationError as exc:
+        except Exception as exc:
             last_error = exc
-            # Truncate very long validation errors to avoid overwhelming the context
+
             exc_str = str(exc)
             if len(exc_str) > 2000:
                 exc_str = exc_str[:2000] + "\n... [truncated]"
@@ -27,7 +37,6 @@ Validation errors:
 {exc_str}
 
 Return the complete corrected structured output.
-Ensure the JSON structure is FLAT as defined: user_stories, backlog_items, and implementation_tasks MUST be top-level lists in the POResult object. Do NOT nest implementation_tasks inside backlog_items.
 
 Universal schema rules:
 - Return only fields defined by the schema.
@@ -37,14 +46,26 @@ Universal schema rules:
 - Do not include empty strings inside lists.
 - Use valid enum values exactly as required.
 - Use snake_case markers with no spaces.
+- Return the complete object, not a partial patch.
 
 POResult rules:
+- user_stories, backlog_items, and implementation_tasks MUST be top-level lists.
+- Do NOT nest implementation_tasks inside backlog_items.
+- Do NOT nest backlog_items inside user_stories.
 - story_id must use US-001 format.
 - backlog_item_id must use BL-001 format.
 - task_id must use TASK-001 format.
-- All related_user_story_ids must reference existing story ids.
-- All related_backlog_item_ids must reference existing backlog item ids.
+- All related_user_story_ids must reference existing story IDs.
+- All related_backlog_item_ids must reference existing backlog item IDs.
 - Do not collapse all tasks into backend unless the BRD truly only describes backend/internal service work.
+- input_context must be a non-empty dictionary for each implementation task.
+- Prefer concrete input_context keys, but do not invent details only to increase key count.
+
+POReviewResult rules:
+- decision must be PASS or NEEDS_REVISION.
+- If decision is PASS, issues must be [].
+- If decision is NEEDS_REVISION, issues must contain at least one blocking issue.
+- Do not put minor/non-blocking suggestions into issues.
 
 DevResult rules:
 - task_id must use TASK-001 format.
@@ -69,6 +90,7 @@ Return only the corrected structured output.
 
     raise last_error
 
+
 def to_pretty_json(data) -> str:
     """Convert data to a pretty-printed JSON string for prompts."""
     if hasattr(data, "model_dump"):
@@ -87,402 +109,647 @@ def to_pretty_json(data) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, default=str)
 
 
+def to_plain_dict(obj: Any) -> Any:
+    """Recursively convert Pydantic models or lists/dicts of them to plain dicts."""
+    if hasattr(obj, "model_dump"):
+        return obj.model_dump(mode="json")
+
+    if isinstance(obj, list):
+        return [to_plain_dict(item) for item in obj]
+
+    if isinstance(obj, dict):
+        return {k: to_plain_dict(v) for k, v in obj.items()}
+
+    return obj
+
+
+# ============================================================
+# PO issue helpers
+# ============================================================
+
+def normalize_issue(issue: dict) -> dict:
+    """Normalize issue shape to avoid prompt formatting errors."""
+    issue = to_plain_dict(issue or {})
+
+    affected_items = issue.get("affected_items", [])
+    if affected_items is None:
+        affected_items = []
+    elif not isinstance(affected_items, list):
+        affected_items = [str(affected_items)]
+
+    return {
+        "category": issue.get("category", "schema_compliance"),
+        "severity": str(issue.get("severity", "HIGH")).upper(),
+        "description": issue.get("description", ""),
+        "affected_items": [str(item) for item in affected_items if str(item).strip()],
+        "suggestion": issue.get("suggestion", ""),
+    }
+
+
+def is_blocking_po_issue(issue: dict) -> bool:
+    """
+    Decide whether a PO review issue should block the flow.
+
+    Current POReviewResult schema only supports:
+    - PASS
+    - NEEDS_REVISION
+
+    Therefore, minor issues must not be returned as issues,
+    otherwise they will force retry.
+    """
+    issue = normalize_issue(issue)
+    severity = issue["severity"]
+    category = str(issue.get("category", "")).lower()
+
+    if severity in {"HIGH", "CRITICAL"}:
+        return True
+
+    # LOW/MEDIUM are normally non-blocking.
+    # Keep this conservative to prevent retry loops.
+    return False
+
+
+def filter_active_po_issues(issues: list[dict] | None) -> list[dict]:
+    """
+    Keep only active blocking issues for retry prompts.
+
+    Important:
+    - Do not pass all historical issues into PO.
+    - Do not pass LOW/MEDIUM suggestions into PO retry.
+    """
+    clean = [normalize_issue(issue) for issue in to_plain_dict(issues or [])]
+    return [issue for issue in clean if is_blocking_po_issue(issue)]
+
+
+def has_observable_detail(text: str) -> bool:
+    """
+    Lightweight heuristic to avoid treating every vague phrase as blocking.
+    If the AC contains concrete verification details, vague wording is non-blocking.
+    """
+    text_lower = (text or "").lower()
+
+    observable_signals = [
+        "http ",
+        "status code",
+        "returns ",
+        "return ",
+        "response",
+        "error_code",
+        "message",
+        "details",
+        "field",
+        "reason",
+        "ui",
+        "page",
+        "screen",
+        "button",
+        "form",
+        "banner",
+        "modal",
+        "toast",
+        "empty state",
+        "loading state",
+        "disabled",
+        "enabled",
+        "database",
+        "table",
+        "stored",
+        "persisted",
+        "redis",
+        "cache key",
+        "marker",
+        "given ",
+        "when ",
+        "then ",
+        "must ",
+        "equals",
+        "contains",
+        "within ",
+        "less than",
+        "greater than",
+        "422",
+        "400",
+        "401",
+        "403",
+        "404",
+        "409",
+        "500",
+    ]
+
+    return any(signal in text_lower for signal in observable_signals)
+
+
+def validate_po_result_locally(po: POResult) -> list[dict]:
+    """
+    Rule-based PO validation.
+
+    Important behavior:
+    - Only return HIGH/CRITICAL for truly blocking issues.
+    - Return LOW/MEDIUM for guidance only.
+    - Downstream retry should only use blocking issues.
+    """
+    issues: list[dict] = []
+
+    vague_phrases = [
+        "properly",
+        "correctly",
+        "gracefully",
+        "seamlessly",
+        "user-friendly",
+        "fast",
+        "performant",
+        "scalable",
+        "secure",
+        "robust",
+        "maintainable",
+        "extensible",
+        "clean",
+        "future extension",
+        "allow future extension",
+        "structured error responses",
+        "consistent with design",
+        "normal response time",
+        "as needed",
+        "where applicable",
+        "works well",
+        "appropriate",
+        "relevant",
+        "optimized",
+    ]
+
+    # 1. Acceptance Criteria quality for user stories
+    for story in po.user_stories:
+        for idx, ac in enumerate(story.acceptance_criteria or [], 1):
+            ac_text = ac or ""
+            found = [p for p in vague_phrases if p in ac_text.lower()]
+
+            if found and not has_observable_detail(ac_text):
+                issues.append({
+                    "category": "acceptance_criteria",
+                    "severity": "HIGH",
+                    "description": (
+                        f"Story {story.story_id} AC-{idx} contains vague phrase(s) {found} "
+                        "without concrete observable verification details."
+                    ),
+                    "affected_items": [f"{story.story_id}.acceptance_criteria[{idx}]"],
+                    "suggestion": (
+                        "Rewrite the AC with condition/input, observable behavior, and expected output/state/status."
+                    ),
+                })
+            elif found:
+                issues.append({
+                    "category": "acceptance_criteria",
+                    "severity": "LOW",
+                    "description": (
+                        f"Story {story.story_id} AC-{idx} contains vague phrase(s) {found}, "
+                        "but also appears to include observable details."
+                    ),
+                    "affected_items": [f"{story.story_id}.acceptance_criteria[{idx}]"],
+                    "suggestion": "Consider removing vague wording if it is not needed.",
+                })
+
+    # 2. Acceptance Criteria quality for tasks
+    for task in po.implementation_tasks:
+        for idx, ac in enumerate(task.acceptance_criteria or [], 1):
+            ac_text = ac or ""
+            found = [p for p in vague_phrases if p in ac_text.lower()]
+
+            if found and not has_observable_detail(ac_text):
+                issues.append({
+                    "category": "acceptance_criteria",
+                    "severity": "HIGH",
+                    "description": (
+                        f"Task {task.task_id} AC-{idx} contains vague phrase(s) {found} "
+                        "without concrete observable verification details."
+                    ),
+                    "affected_items": [f"{task.task_id}.acceptance_criteria[{idx}]"],
+                    "suggestion": (
+                        "Rewrite the AC so DEV/QC can verify it with a clear pass/fail signal."
+                    ),
+                })
+            elif found:
+                issues.append({
+                    "category": "acceptance_criteria",
+                    "severity": "LOW",
+                    "description": (
+                        f"Task {task.task_id} AC-{idx} contains vague phrase(s) {found}, "
+                        "but also appears to include observable details."
+                    ),
+                    "affected_items": [f"{task.task_id}.acceptance_criteria[{idx}]"],
+                    "suggestion": "Consider removing vague wording if it is not needed.",
+                })
+
+    # 3. Backlog traceability
+    story_ids = {s.story_id for s in po.user_stories}
+
+    for item in po.backlog_items:
+        if not item.related_user_story_ids:
+            issues.append({
+                "category": "traceability",
+                "severity": "HIGH",
+                "description": f"Backlog item {item.backlog_item_id} is not linked to any user story.",
+                "affected_items": [item.backlog_item_id],
+                "suggestion": "Link this backlog item to at least one existing user story.",
+            })
+
+        unknown_story_ids = [
+            sid for sid in item.related_user_story_ids or []
+            if sid not in story_ids
+        ]
+        if unknown_story_ids:
+            issues.append({
+                "category": "traceability",
+                "severity": "HIGH",
+                "description": (
+                    f"Backlog item {item.backlog_item_id} references unknown story IDs: {unknown_story_ids}."
+                ),
+                "affected_items": [item.backlog_item_id],
+                "suggestion": "Use only existing story IDs in related_user_story_ids.",
+            })
+
+    # 4. Task traceability and task quality
+    backlog_ids = {b.backlog_item_id for b in po.backlog_items}
+
+    for task in po.implementation_tasks:
+        if not task.related_user_story_ids:
+            issues.append({
+                "category": "traceability",
+                "severity": "HIGH",
+                "description": f"Task {task.task_id} is not linked to any user story.",
+                "affected_items": [task.task_id],
+                "suggestion": "Link this task to at least one existing user story.",
+            })
+
+        unknown_story_ids = [
+            sid for sid in task.related_user_story_ids or []
+            if sid not in story_ids
+        ]
+        if unknown_story_ids:
+            issues.append({
+                "category": "traceability",
+                "severity": "HIGH",
+                "description": (
+                    f"Task {task.task_id} references unknown story IDs: {unknown_story_ids}."
+                ),
+                "affected_items": [task.task_id],
+                "suggestion": "Use only existing story IDs in related_user_story_ids.",
+            })
+
+        if not task.related_backlog_item_ids:
+            issues.append({
+                "category": "traceability",
+                "severity": "HIGH",
+                "description": f"Task {task.task_id} is not linked to any backlog item.",
+                "affected_items": [task.task_id],
+                "suggestion": "Link this task to at least one existing backlog item.",
+            })
+
+        unknown_backlog_ids = [
+            bid for bid in task.related_backlog_item_ids or []
+            if bid not in backlog_ids
+        ]
+        if unknown_backlog_ids:
+            issues.append({
+                "category": "traceability",
+                "severity": "HIGH",
+                "description": (
+                    f"Task {task.task_id} references unknown backlog item IDs: {unknown_backlog_ids}."
+                ),
+                "affected_items": [task.task_id],
+                "suggestion": "Use only existing backlog item IDs in related_backlog_item_ids.",
+            })
+
+        # input_context should not be a retry trap.
+        # Empty/invalid is blocking. Fewer than 3 keys is only guidance.
+        input_context = getattr(task, "input_context", None)
+
+        if not isinstance(input_context, dict) or len(input_context) == 0:
+            issues.append({
+                "category": "schema_compliance",
+                "severity": "HIGH",
+                "description": f"Task {task.task_id} input_context is empty or invalid.",
+                "affected_items": [f"{task.task_id}.input_context"],
+                "suggestion": (
+                    "Provide a non-empty machine-readable input_context with concrete implementation hints."
+                ),
+            })
+        elif len(input_context) < 3:
+            issues.append({
+                "category": "schema_compliance",
+                "severity": "LOW",
+                "description": (
+                    f"Task {task.task_id} input_context has only {len(input_context)} key(s). "
+                    "This is acceptable if the keys are concrete and useful."
+                ),
+                "affected_items": [f"{task.task_id}.input_context"],
+                "suggestion": (
+                    "Add more implementation hints only if available in the BRD. Do not invent details."
+                ),
+            })
+
+        if not task.acceptance_criteria:
+            issues.append({
+                "category": "acceptance_criteria",
+                "severity": "HIGH",
+                "description": f"Task {task.task_id} has no acceptance criteria.",
+                "affected_items": [task.task_id],
+                "suggestion": "Define at least one pass/fail observable acceptance criterion.",
+            })
+
+        if not task.required_markers:
+            issues.append({
+                "category": "marker_quality",
+                "severity": "HIGH",
+                "description": f"Task {task.task_id} has no required_markers.",
+                "affected_items": [f"{task.task_id}.required_markers"],
+                "suggestion": "Add concrete snake_case markers that DEV/QC can verify.",
+            })
+        else:
+            bad_markers = [
+                m for m in task.required_markers
+                if m in GENERIC_MARKERS_BLACKLIST
+            ]
+
+            if bad_markers:
+                issues.append({
+                    "category": "marker_quality",
+                    "severity": "HIGH",
+                    "description": (
+                        f"Task {task.task_id} contains blacklisted generic markers: {bad_markers}."
+                    ),
+                    "affected_items": [f"{task.task_id}.required_markers"],
+                    "suggestion": (
+                        "Replace generic markers with resource/action/result-specific identifiers, "
+                        "for example product_create_post_api_v1_rejects_negative_price."
+                    ),
+                })
+
+    return [normalize_issue(issue) for issue in issues]
+
+
+# ============================================================
+# Base OpenAI agent
+# ============================================================
 
 class OpenAIAPIAgent:
     """Base class for OpenAI-powered agents."""
+
     def __init__(self, api_key: str, model: str = "gpt-5-mini"):
         self.llm = ChatOpenAI(model=model, api_key=api_key, temperature=0)
 
 
-class POAgent(OpenAIAPIAgent):
-    """Product Owner agent responsible for BRD analysis and task breakdown."""
-    def analyze(
-        self,
-        brd_content: str,
-        previous_result: dict | None = None,
-        review_issues: list[dict] | None = None
-    ) -> POResult:
-        structured_llm = self.llm.with_structured_output(
-            POResult,
-            method="function_calling",
-        )
+# ============================================================
+# PO Agent
+# ============================================================
 
-        feedback_block = ""
-        if review_issues:
-            feedback_block = "\n### REVISION FEEDBACK\n"
-            feedback_block += "You are in REVISION MODE. The following issues were found in your previous output. You MUST address each one:\n"
-            for idx, issue in enumerate(review_issues, 1):
-                feedback_block += f"{idx}. [{issue.get('category')}] (Severity: {issue.get('severity')}): {issue.get('description')}\n"
-                feedback_block += f"   Affected items: {', '.join(issue.get('affected_items', []))}\n"
-                feedback_block += f"   Suggestion: {issue.get('suggestion')}\n"
-
-        previous_artifacts_block = ""
-        if previous_result:
-            previous_artifacts_block = "\n### PREVIOUS ARTIFACTS\n"
-            previous_artifacts_block += to_pretty_json(previous_result)
-
-        messages = [
-            (
-    "system",
-    """
+PO_SYSTEM_PROMPT = """
 You are a senior Product Owner working with engineering delivery teams.
 
 Your job is to transform a Business Requirement Document (BRD) into delivery-ready product and engineering artifacts.
 
 You must return structured output that exactly matches the POResult schema.
 
-Core principles:
-1. Be precise, structured, and implementation-oriented.
-2. Use only information supported by the BRD.
-3. Do not invent unsupported scope, features, integrations, screens, APIs, fields, workflows, business rules, or non-functional requirements.
-4. If the BRD is ambiguous or incomplete, make only the smallest reasonable assumption.
-5. Every assumption must be explicitly included in the relevant assumptions field.
-6. Avoid vague, subjective, or non-testable requirements.
-7. Think in a way that helps downstream DEV and QC agents implement and validate the work with minimal ambiguity.
+Priority 1 — Must obey:
+1. Base the output only on the BRD.
+2. Do not invent unsupported scope, features, integrations, screens, APIs, fields, workflows, business rules, or non-functional requirements.
+3. If the BRD is ambiguous or incomplete, use the smallest reasonable assumption and record it in assumptions.
+4. If missing information blocks implementation, create a product clarification task instead of inventing the answer.
+5. user_stories, backlog_items, and implementation_tasks must be top-level flat lists.
+6. All IDs must be stable and traceable:
+   - story_id: US-001, US-002, ...
+   - backlog_item_id: BL-001, BL-002, ...
+   - task_id: TASK-001, TASK-002, ...
+7. Every backlog item must reference at least one existing user story.
+8. Every implementation task must reference at least one existing user story and one existing backlog item.
+9. Do not collapse all work into backend unless the BRD truly only describes backend/internal service work.
 
-Schema compliance rules:
-- Return only fields defined by the schema.
-- Do not add extra fields.
+Priority 2 — Quality bar:
+1. User stories must include actor, goal, and value.
+2. Acceptance criteria must be observable, testable, and pass/fail verifiable.
+3. Each acceptance criterion should include:
+   - a condition/input,
+   - an observable behavior,
+   - an expected output, state, status code, UI state, stored value, marker, or validation result.
+4. Implementation tasks must be concrete, small enough for one team, non-overlapping, and actionable.
+5. required_markers must be snake_case, concrete, and verifiable.
+6. input_context must be a non-empty dictionary with concrete hints useful for the DEV agent.
+7. Prefer 2-5 concrete input_context keys. Do not invent context keys just to satisfy quantity.
+
+Priority 3 — Domain decomposition:
+1. Create tasks only for domains supported by the BRD.
+2. Use product for open questions, unresolved product decisions, requirement clarification, and blocked business rules.
+3. Use backend for APIs, services, business rules, auth, validation, integrations, transactions, and orchestration.
+4. Use frontend for screens, forms, UI behavior, routing, visible states, and client-side validation.
+5. Use mobile only for mobile-specific behavior.
+6. Use data for schema, migrations, seed data, indexes, persistence design, analytics tables, and storage structures.
+7. Use devops/platform for Docker, deployment, CI/CD, environment configuration, service orchestration, and monitoring.
+8. Use qa for explicit QA plans, regression suites, manual validation, security tests, or performance tests.
+9. Use security for security-specific controls beyond ordinary backend validation.
+10. Use design only when the BRD explicitly asks for UX/UI deliverables.
+11. Use unknown only when the responsible domain cannot reasonably be determined.
+
+Revision mode rules:
+1. When review feedback is provided, fix active blocking issues first.
+2. Preserve valid existing story_id, backlog_item_id, and task_id values.
+3. Do not rewrite unrelated valid artifacts.
+4. Do not re-index unless the existing structure is invalid.
+5. Use reviewer suggestions when they are specific and BRD-compatible.
+6. If feedback points to missing BRD information, add an assumption or product clarification task instead of inventing behavior.
+7. Populate resolution_map with how each active issue was addressed.
+8. Self-audit before returning.
+
+Acceptance criteria wording:
+- Avoid vague criteria such as “works correctly”, “handles gracefully”, “fast”, “secure”, “maintainable”, “as needed”, or “structured error responses” unless the same criterion also includes exact observable verification details.
+- Do not treat quality concepts as invalid by themselves. Make them measurable.
+
+Good acceptance criteria examples:
+- For validation failures, the API returns HTTP 422 with JSON body containing error_code, message, and details[]. Each details[] item includes field and reason.
+- When checkout encounters deleted product_ids in the cart, the checkout response includes skipped_product_ids and continues checkout for remaining valid items.
+- If all cart items reference deleted products, checkout returns HTTP 422 with error_code CART_HAS_NO_VALID_ITEMS.
+- If the product list is empty, the page displays an empty state message and no product cards.
+
+Marker rules:
+- required_markers must be concrete snake_case identifiers.
+- Markers must describe specific verifiable behavior, not generic activity.
+- Good examples:
+  - product_create_post_api_v1_rejects_negative_price
+  - checkout_post_api_v1_returns_422_when_no_valid_items_remain
+  - product_list_page_renders_empty_state_when_no_products
+  - products_table_price_positive_constraint_added
+  - docker_compose_starts_api_database_and_redis_services
+  - checkout_deleted_product_scenario_test_defined
+- Bad examples:
+  - good_quality
+  - clean_code
+  - secure
+  - works_correctly
+  - input_validation
+  - request_validation
+  - api_endpoint_created
+  - tests_added
+  - backend_done
+
+Schema rules:
+- Return only fields defined by the POResult schema.
+- Do not include extra fields.
 - Do not omit required fields.
 - Do not use empty strings for required fields.
-- Do not include empty strings inside any list.
-- All enum values must use the exact allowed values.
-- Priority must be one of: LOW, MEDIUM, HIGH, CRITICAL.
-- Team values must be one of:
-  product, backend, frontend, fullstack, mobile, data, devops, platform, qa, security, design, unknown.
-- If the responsible team is unclear, use "unknown".
+- Do not include empty strings inside lists.
+- Priority must be one of: LOW, MEDIUM, HIGH.
+- Team must be one of: product, backend, frontend, fullstack, mobile, data, devops, platform, qa, security, design, unknown.
+- If the responsible team is unclear, use unknown.
+- resolution_map is mandatory in revision mode.
 
-Required POResult fields (MUST be top-level lists, NOT nested):
-1. feature_summary
-2. user_stories
-3. backlog_items
-4. implementation_tasks
+Return only the structured output matching the POResult schema.
+"""
 
-Hierarchy rules:
-- user_stories, backlog_items, and implementation_tasks MUST be separate flat lists at the root of the JSON object.
-- Do NOT nest implementation_tasks inside backlog_items.
-- Do NOT nest backlog_items inside user_stories.
-- Cross-reference using IDs only (US-001, BL-001, TASK-001).
 
-Domain-aware decomposition:
-- Identify all delivery domains explicitly or strongly indicated by the BRD.
-- Do not assign every task to backend unless the BRD truly only describes backend/internal service work.
-- Only create tasks for domains supported by the BRD.
-- Do not create tasks for a domain just because it commonly exists in software projects.
-- If the BRD explicitly groups requirements by department, team, layer, platform, technology, or responsibility area, preserve that decomposition where it improves delivery clarity.
-- If the BRD describes both user-facing behavior and backend behavior, create separate frontend and backend tasks unless a single fullstack task is clearly more appropriate.
-- If the BRD describes user-facing screens, pages, forms, dashboards, navigation, visible states, admin screens, customer-facing flows, or web/mobile interactions, create frontend or mobile tasks as appropriate.
-- If the BRD describes APIs, services, authentication, authorization, server-side validation, transactions, cache invalidation, integrations, or backend orchestration, create backend tasks.
-- If the BRD describes database schema, persistence, migrations, seed data, indexes, cache structures, storage keys, reporting tables, or data storage design, create data tasks or backend/data tasks as appropriate.
-- If the BRD describes Docker, docker-compose, deployment, infrastructure, runtime services, CI/CD, monitoring, environment configuration, or service composition, create devops or platform tasks as appropriate.
-- If the BRD describes test cases, QA responsibilities, acceptance validation, regression testing, security testing, performance verification, or manual validation, create QA tasks as appropriate.
-- If the BRD describes open questions, unresolved business decisions, requirement clarification, policy choices, or BA clarification items, create product clarification tasks instead of silently assuming implementation behavior.
-- If the BRD describes security controls, authentication, authorization, token handling, audit logging, sensitive data, or access restrictions, assign implementation to backend/security as appropriate.
-- Use fullstack only when frontend and backend work are tightly coupled and cannot be cleanly separated.
-- Use unknown only when the responsible domain cannot reasonably be determined.
+class POAgent(OpenAIAPIAgent):
+    """Product Owner agent responsible for BRD analysis and task breakdown."""
 
-Domain coverage rules:
-- If a BRD section explicitly names a domain, team, technology layer, or responsibility area, ensure the generated backlog and tasks cover that area.
-- If a BRD contains sections similar to Backend, Frontend, Database, DevOps, QA, BA, Product, Security, Infrastructure, Mobile, Data, or Platform, do not collapse all of them into backend tasks.
-- If a requirement is an open question, do not convert it into implementation scope unless the BRD already provides an answer.
-- Product clarification tasks are valid implementation_tasks when the BRD explicitly contains unresolved decisions or BA questions.
-- If the BRD includes non-functional requirements such as response time, security, availability, auditability, or performance, create QA/security/devops/backend tasks only where the BRD provides enough scope to validate or implement them.
+    def analyze(
+        self,
+        brd_content: str,
+        previous_result: dict | None = None,
+        review_issues: list[dict] | None = None,
+    ) -> POResult:
+        structured_llm = self.llm.with_structured_output(
+            POResult,
+            method="function_calling",
+        )
 
-User story schema:
-Each user story must include:
-- story_id
-- title
-- description
-- priority
-- acceptance_criteria
-- assumptions
-- source_references
+        # Important:
+        # PO should only receive active blocking issues.
+        # Do not feed all historical LOW/MEDIUM issues into the retry prompt.
+        clean_issues = filter_active_po_issues(review_issues or [])
 
-User story rules:
-- story_id must use the format US-001, US-002, etc.
-- title must be short and descriptive.
-- description should preferably follow:
-  "As a ..., I want ..., so that ..."
-- Each user story must include:
-  - actor / role
-  - goal / need
-  - business, user, operational, or compliance value
-- Technical or enabler stories may use internal actors such as backend engineer, frontend engineer, platform engineer, QA engineer, operations team, administrator, security engineer, data engineer, DevOps engineer, or product owner.
-- acceptance_criteria must be specific, observable, testable, and relevant to the story.
-- assumptions must contain only assumptions needed because the BRD is ambiguous or incomplete.
-- If no assumptions are needed, use an empty list.
-- source_references should contain BRD section names, headings, bullet summaries, or short supporting references.
-- If the BRD has no explicit section labels, use short references such as "BRD requirement: user login" or "BRD bullet: product catalog".
+        feedback_block = ""
+        if clean_issues:
+            feedback_block = "\n### REVISION MODE: ACTIVE BLOCKING ISSUES ONLY\n"
+            feedback_block += (
+                "You are revising a previous POResult. The issues below are active unresolved blocking issues.\n"
+                "Your goal is convergence: fix these issues without rewriting unrelated valid artifacts.\n\n"
+            )
+            feedback_block += "Revision rules:\n"
+            feedback_block += "1. Fix all active HIGH/CRITICAL issues first.\n"
+            feedback_block += "2. Preserve valid story_id, backlog_item_id, and task_id from previous results.\n"
+            feedback_block += "3. Do not re-index IDs unless the existing structure is invalid.\n"
+            feedback_block += "4. Do not rewrite unrelated stories, backlog items, or tasks.\n"
+            feedback_block += "5. If a reviewer suggestion is specific and BRD-compatible, follow it.\n"
+            feedback_block += "6. If BRD information is missing, do not invent behavior. Add a minimal assumption or create a product clarification task.\n"
+            feedback_block += "7. Populate resolution_map with how each active issue was resolved.\n"
+            feedback_block += "8. Self-audit the revised output for schema, traceability, testable AC, marker quality, and BRD faithfulness.\n\n"
 
-Backlog item schema:
-Each backlog item must include:
-- backlog_item_id
-- title
-- description
-- team
-- related_user_story_ids
-- assumptions
+            for idx, issue in enumerate(clean_issues, 1):
+                affected_items = issue.get("affected_items", [])
+                feedback_block += f"{idx}. [{issue.get('category')}] Severity: {issue.get('severity')}\n"
+                feedback_block += f"   Description: {issue.get('description')}\n"
+                feedback_block += f"   Affected items: {', '.join(affected_items)}\n"
+                feedback_block += f"   Required fix: {issue.get('suggestion')}\n\n"
 
-Backlog item rules:
-- backlog_item_id must use the format BL-001, BL-002, etc.
-- title must be short and descriptive.
-- description must describe concrete backlog scope.
-- team must use one of the allowed Team enum values.
-- related_user_story_ids must reference existing user story ids.
-- Each backlog item must be traceable to at least one user story.
-- Backlog items should be grouped by implementation domain or team where appropriate.
-- Do not create vague backlog containers such as "backend work", "frontend work", or "testing" without concrete scope.
-- Backlog items must not significantly overlap.
+        previous_artifacts_block = ""
+        if previous_result:
+            previous_artifacts_block = "\n### PREVIOUS ARTIFACTS\n"
+            previous_artifacts_block += (
+                "Use these artifacts as the base revision target. Preserve valid IDs and unchanged valid sections.\n"
+            )
+            previous_artifacts_block += to_pretty_json(previous_result)
 
-Implementation task schema:
-Each implementation task must include:
-- task_id
-- title
-- description
-- assignee_team
-- related_user_story_ids
-- related_backlog_item_ids
-- acceptance_criteria
-- required_markers
-- assumptions
-- input_context
+        human_prompt = f"""
+Analyze the following BRD and return a structured POResult.
 
-Implementation task rules:
-- task_id must use the format TASK-001, TASK-002, etc.
-- title must be short and descriptive.
-- description is mandatory and must explain the concrete implementation work in 1-3 sentences.
-- assignee_team must use exactly one allowed Team enum value.
-- assignee_team must match the actual implementation domain.
-- related_user_story_ids must reference existing user story ids.
-- related_backlog_item_ids must reference existing backlog item ids.
-- Each task must be small enough for one team to execute.
-- Each task must be actionable, non-overlapping, and implementation-oriented.
-- Each task must include only the acceptance criteria relevant to that task.
-- Do not merge unrelated domains into one task.
-- Do not assign a frontend task to backend just because it consumes an API.
-- Do not assign database migration or seed-data work to backend if the BRD treats database work as a separate delivery responsibility.
-- Do not assign QA validation work to backend unless the BRD only asks for developer unit tests.
-- Open questions must not become implementation tasks unless the BRD already provides an answer; create product clarification tasks instead.
-- Do not create generic placeholder tasks such as:
-  - "implement backend"
-  - "build frontend"
-  - "create API"
-  - "write tests"
-  unless the concrete behavior, input, output, and verification target are clear.
-- input_context must be a machine-readable dictionary useful for the DEV agent.
-- input_context may include keys such as:
-  - "brd_context"
-  - "expected_inputs"
-  - "expected_outputs"
-  - "dependencies"
-  - "out_of_scope"
-  - "data_entities"
-  - "api_contract"
-  - "ui_behavior"
-  - "storage_design"
-  - "test_focus"
-  - "open_questions"
-- If no extra context is needed, use an empty object.
+{feedback_block}
 
-Team assignment examples:
-- Use product for open questions, requirement clarification, business decisions, acceptance rule clarification, and unresolved product behavior.
-- Use backend for APIs, services, business rules, authentication, authorization, server-side validation, transactions, cache invalidation, integrations, and backend orchestration.
-- Use frontend for web pages, admin/customer screens, forms, components, routing, client-side validation, loading states, empty states, error messages, local storage/cookie handling, and UI integration with APIs.
-- Use mobile for mobile-specific screens, gestures, mobile storage, push notifications, or native/mobile app behavior.
-- Use data for database schema, migrations, seed data, indexes, persistence design, data models, analytics tables, and storage structure.
-- Use devops or platform for Docker, docker-compose, deployment, infrastructure, CI/CD, environment variables, monitoring, and runtime configuration.
-- Use security for security-specific controls that go beyond ordinary backend validation.
-- Use qa for explicit QA plans, regression suites, manual test cases, security tests, performance tests, or validation scenarios if required by the BRD.
-- Use design only when the BRD explicitly asks for UX/UI design deliverables.
-
-Acceptance criteria rules:
-- Acceptance criteria must be specific, testable, observable, and implementation-relevant.
-- Acceptance criteria must be pass/fail verifiable by QC.
-- Do not use vague wording such as "user-friendly", "fast", "secure", "properly", or "works well" unless measurable or concretely defined.
-- Acceptance criteria must not introduce scope that is not supported by the BRD.
-- No acceptance criterion may be an empty string.
-
-Required marker rules:
-- required_markers must be concrete snake_case identifiers.
-- required_markers must contain no spaces, hyphens, punctuation, or uppercase letters.
-
-Good backend marker examples:
-- api_endpoint_created
-- request_validation
-- authentication_required
-- authorization_check
-- transaction_committed
-- cache_invalidated
-- unit_test_for_invalid_payload
-
-Good frontend marker examples:
-- login_form_rendered
-- form_validation_displayed
-- loading_state_displayed
-- empty_state_displayed
-- error_message_displayed
-- submit_button_disabled_while_loading
-- success_navigation_handled
-- api_error_message_rendered
-
-Good data marker examples:
-- migration_created
-- seed_data_created
-- index_created
-- foreign_key_constraint_added
-- data_persistence_verified
-- cache_key_structure_defined
-
-Good devops/platform marker examples:
-- dockerfile_created
-- docker_compose_configured
-- environment_variables_documented
-- service_healthcheck_configured
-- local_stack_runs_with_dependencies
-
-Good QA marker examples:
-- checkout_test_cases_defined
-- unauthorized_access_tested
-- performance_threshold_test_defined
-- regression_scenario_documented
-
-Good product marker examples:
-- open_question_documented
-- decision_required_before_implementation
-- acceptance_rule_clarified
-
-Bad marker examples:
-- good_quality
-- clean_code
-- secure
-- works_correctly
-- proper_testing
-- nice_ui
-- order persisted
-- marker with spaces
-
-- Each required_marker must be relevant to the task acceptance criteria.
-- Do not include markers that cannot reasonably be evidenced by code, tests, implementation notes, or product clarification output.
-
-Cross-reference rules:
-- All related_user_story_ids must reference existing story_id values.
-- All related_backlog_item_ids must reference existing backlog_item_id values.
-- Do not create duplicate story_id, backlog_item_id, or task_id values.
-- Traceability must be explicit through ids, not inferred from text similarity.
-
-Negative constraints:
-- Do not add scope beyond the BRD.
-- Do not create overlapping tasks.
-- Do not mix multiple teams into one task unless truly necessary.
-- Do not hide uncertainty.
-- Do not return markdown.
-- Do not explain your reasoning outside the structured output.
-
-Before returning, verify:
-- Every BRD-supported domain is represented by appropriate backlog items and tasks.
-- Not all tasks are backend unless the BRD truly only describes backend/internal work.
-- Every story has a valid story_id.
-- Every backlog item has a valid backlog_item_id.
-- Every task has a valid task_id.
-- Every task has a non-empty description.
-- Every backlog item references existing user stories.
-- Every task references existing user stories and backlog items.
-- Every marker is valid snake_case.
-- No list contains empty strings.
-- No extra fields are included.
-
-Return only the structured output matching the schema.
-    """.strip(),
-),
-            (
-    "human",
-    f"""
-Analyze the following BRD and return the structured POResult.
+{previous_artifacts_block}
 
 Instructions:
 - Base the output only on the BRD.
 - Do not invent unsupported scope.
-- Return only fields defined by the schema.
 - Identify implementation domains from the BRD itself.
-- Do not assign every task to backend unless the BRD truly only describes backend/internal service work.
-- If the BRD explicitly includes frontend, mobile, database, data, devops, platform, QA, BA/product, security, design, or infrastructure responsibilities, create appropriate backlog items and tasks for those domains.
-- If the BRD includes user-facing behavior, include frontend or mobile tasks for visible UI behavior.
-- If the BRD includes persistence, database schema, migrations, seed data, cache structures, or data storage design, include data or backend/data tasks as appropriate.
-- If the BRD includes Docker, deployment, infrastructure, runtime services, CI/CD, monitoring, or service composition, include devops/platform tasks as appropriate.
-- If the BRD includes QA, test cases, performance testing, security testing, regression scenarios, or manual validation, include QA tasks as appropriate.
-- If the BRD includes open questions or unresolved product decisions, include product clarification tasks instead of silently assuming answers.
-- Preserve BRD-supported team/layer separation where it improves delivery clarity.
-- Use stable ids:
-  - User stories: US-001, US-002, ...
-  - Backlog items: BL-001, BL-002, ...
-  - Tasks: TASK-001, TASK-002, ...
-- Ensure every backlog item has related_user_story_ids.
-- Ensure every implementation task has related_user_story_ids and related_backlog_item_ids.
-- Ensure every implementation task has required_markers.
-- Ensure required_markers are snake_case with no spaces.
-- Ensure no acceptance_criteria item is empty.
-- Return only the structured output.
+- Create product clarification tasks for unresolved decisions or open questions.
+- Use explicit assumptions only when needed and keep them minimal.
+- Ensure every user story, backlog item, and implementation task is traceable.
+- Ensure every acceptance criterion is concrete and pass/fail testable.
+- Ensure required_markers are concrete snake_case identifiers.
+- Ensure input_context is non-empty and useful for the DEV agent.
+- In revision mode, preserve valid IDs and update resolution_map.
+- Return only the structured POResult.
 
 <BRD>
 {brd_content}
 </BRD>
-    """.strip(),
-),
+        """.strip()
+
+        messages = [
+            ("system", PO_SYSTEM_PROMPT.strip()),
+            ("human", human_prompt),
         ]
+
         return invoke_structured_with_retry(structured_llm, messages)
 
 
-class POReviewAgent(OpenAIAPIAgent):
-    """PO Review agent — validates PO output before tasks go to DEV.
+# ============================================================
+# PO Review Agent
+# ============================================================
 
-    Acts as a quality gate between the PO phase and task execution,
-    checking user story format, BRD completeness, task clarity, and
-    traceability.
-    """
-    def review(
-        self,
-        brd_content: str,
-        feature_summary: str,
-        user_stories: list[dict],
-        backlog_items: list[dict],
-        implementation_tasks: list[dict],
-    ) -> POReviewResult:
-        structured_llm = self.llm.with_structured_output(
-            POReviewResult,
-            method="function_calling",
-        )
-
-        brd_text = brd_content or ""
-        stories_json = to_pretty_json(user_stories or [])
-        backlog_json = to_pretty_json(backlog_items or [])
-        tasks_json = to_pretty_json(implementation_tasks or [])
-
-        messages = [
-            (
-    "system",
-    """
+PO_REVIEW_SYSTEM_PROMPT = """
 You are a senior Product Owner reviewer performing a quality gate on PO-generated artifacts.
 
-Your job is to validate the PO output BEFORE it is sent downstream to DEV and QC agents.
+Your job is to decide whether the PO output is ready to be sent downstream to DEV and QC agents.
 
 You must return structured output that exactly matches the POReviewResult schema.
 
-You must base your review only on:
-1. The provided BRD.
-2. The provided feature_summary.
-3. The provided user_stories.
-4. The provided backlog_items.
-5. The provided implementation_tasks.
+Review scope:
+1. Use only the provided BRD, feature_summary, user_stories, backlog_items, and implementation_tasks.
+2. Do not invent new requirements.
+3. Do not expand scope beyond the BRD.
+4. Do not require domains, APIs, screens, tests, infrastructure, or security controls that are not explicit or strongly indicated by the BRD.
 
-Do not assume missing context.
-Do not invent new requirements.
-Do not expand scope beyond the BRD.
+Important decision policy:
+1. Return NEEDS_REVISION only when there is at least one blocking issue.
+2. A blocking issue is an issue that prevents DEV/QC from implementing or validating the work safely.
+3. Minor wording, style, or improvement suggestions must not block the flow.
+4. If only minor/non-blocking issues exist, return PASS with an empty issues list.
+5. Do not use issues as a place for optional suggestions.
+6. Be strict about blocking problems, but optimize for convergence.
+
+Blocking issue examples:
+- A BRD requirement is missing from all stories/tasks.
+- A story/task invents unsupported scope.
+- A task is not actionable enough for DEV.
+- Acceptance criteria are not testable and provide no observable behavior.
+- Required IDs or traceability are missing or invalid.
+- A task has no acceptance criteria.
+- required_markers are missing or unusable.
+- input_context is empty, null, or not a dictionary.
+- Tasks are collapsed into the wrong domain despite clear BRD domain separation.
+- Open product questions are converted into implementation behavior without an assumption or clarification task.
+
+Non-blocking issue examples:
+- A phrase could be more precise but the criterion is still testable.
+- input_context has fewer than 3 keys but is non-empty and useful.
+- A marker could be more specific but is still snake_case and verifiable.
+- Story wording does not exactly follow “As a..., I want..., so that...” but actor, goal, and value are clear.
+- Minor style, formatting, or naming improvements that do not block DEV/QC.
+
+Assumption and missing context policy:
+1. Do not fail explicit, minimal, BRD-aligned assumptions.
+2. Fail only if an assumption invents new business rules, integrations, APIs, screens, workflows, data fields, or non-functional requirements not supported by the BRD.
+3. If the BRD contains open questions or unresolved decisions, accept product clarification tasks as valid output.
+4. Do not require the PO to solve missing business decisions that are not in the BRD.
+
+Previous issue / retry policy:
+1. If previous issues are provided, check whether they are still present in the current artifacts.
+2. Do not repeat an old issue if it has been resolved.
+3. If an old issue persists, report it with a more specific suggestion.
+4. Only introduce a new issue during retry if it is blocking or was introduced by the latest revision.
+5. Do not create a moving target by reporting minor new issues after blocking issues have been fixed.
 
 Schema compliance rules:
 - Return only fields defined by the POReviewResult schema.
 - decision must be exactly PASS or NEEDS_REVISION.
 - If decision is PASS, issues must be empty.
-- If decision is NEEDS_REVISION, issues must contain at least one issue.
+- If decision is NEEDS_REVISION, issues must contain at least one blocking issue.
 - Each issue must include:
   - category
   - severity
@@ -504,155 +771,141 @@ Schema compliance rules:
   - MEDIUM
   - HIGH
   - CRITICAL
+- Use HIGH or CRITICAL for blocking issues.
+- Do not return LOW or MEDIUM issues. Minor issues should not be included in issues.
 - affected_items must contain specific ids, fields, criteria, or markers where possible.
 - suggestion must be actionable and specific.
-- Do not include empty strings in affected_items or suggestions.
 
 Review dimensions:
 
-1. Schema Compliance
-- Verify required fields are present and meaningful.
-- User stories should include story_id, title, description, priority, acceptance_criteria, assumptions, and source_references.
-- Backlog items should include backlog_item_id, title, description, team, related_user_story_ids, and assumptions.
-- Implementation tasks should include task_id, title, description, assignee_team, related_user_story_ids, related_backlog_item_ids, acceptance_criteria, required_markers, assumptions, and input_context.
-- Report missing, empty, malformed, or inconsistent fields as schema_compliance.
+1. Completeness vs BRD
+- Verify that explicit BRD requirements are covered by stories/backlog/tasks.
+- Do not require unsupported implied requirements.
+- If a requirement is missing, report completeness.
 
-2. User Story Format
-- Each user story should preferably follow:
-  "As a ..., I want ..., so that ..."
-- Minor wording variations are acceptable if the story clearly includes:
-  - actor / role
-  - goal / need
-  - business, user, operational, or compliance value
-- Technical or enabler stories may use internal actors such as backend engineer, frontend engineer, platform engineer, QA engineer, operations team, administrator, security engineer, data engineer, DevOps engineer, or product owner.
-- Report story_format only if a story is missing actor, goal, value, or is merely a title/label.
+2. User story quality
+- Stories should include actor, goal, and value.
+- Exact wording is not required.
+- Report story_format only if actor, goal, or value is missing.
 
-3. Completeness vs BRD
-- Every explicit BRD requirement must be covered by at least one user story.
-- Clearly supported implied requirements may be considered, but do not infer requirements from domain expectations alone.
-- If a BRD requirement is missing from the stories, report completeness.
-- If evidence is insufficient, state that clearly in the issue description.
+3. Backlog quality
+- Backlog items must be concrete and traceable to user stories.
+- Report vague, duplicate, unsupported, or untraceable backlog items.
 
-4. Domain Coverage
-- Validate that backlog items and implementation tasks cover the domains explicitly or strongly indicated by the BRD.
-- Do not require every possible domain to appear.
-- Only require a domain when the BRD supports it.
-- If the BRD explicitly includes frontend pages, forms, UI flows, customer-facing screens, admin screens, web-app behavior, or visible user interactions, verify that frontend tasks exist.
-- If the BRD explicitly includes mobile-specific behavior, verify that mobile tasks exist.
-- If the BRD explicitly includes backend APIs, services, authentication, authorization, transactions, integrations, server-side validation, or backend logic, verify that backend tasks exist.
-- If the BRD explicitly includes database schema, migrations, seed data, persistence structures, cache structures, storage keys, or data storage design, verify that data or backend/data tasks exist.
-- If the BRD explicitly includes Docker, docker-compose, deployment, infrastructure, environment configuration, service orchestration, CI/CD, runtime dependencies, or monitoring, verify that devops/platform tasks exist.
-- If the BRD explicitly includes QA, test cases, performance testing, security testing, manual validation, or regression checks, verify that QA tasks exist where appropriate.
-- If the BRD explicitly lists open questions, unresolved decisions, BA clarification items, or product policy choices, verify that product clarification tasks or explicit assumptions capture them.
-- If the BRD explicitly includes security, audit, permission, token, sensitive data, or access-control requirements, verify that backend/security tasks cover them.
-- If all implementation tasks are assigned to backend while the BRD clearly includes frontend, data, devops/platform, QA, product clarification, security, mobile, or design work, decision must be NEEDS_REVISION.
-- Report missing BRD-supported domain coverage as completeness.
-- Report incorrect assignee_team selection as task_clarity.
-- Do not fail backend-only output when the BRD genuinely describes only backend/internal service work.
+4. Task clarity
+- Tasks must be actionable, non-overlapping, assigned to a suitable single team, and small enough for one team.
+- Product clarification tasks are valid when BRD has open questions.
+- Report vague, duplicate, wrong-team, unsupported, or non-actionable tasks.
 
-5. Backlog Quality
-- Each backlog item must be specific enough to guide implementation.
-- Each backlog item must be traceable to at least one user story through related_user_story_ids.
-- Backlog items should not be vague containers.
-- Backlog items should not significantly overlap.
-- team must be a suitable allowed Team enum value.
-- Report vague, duplicated, unsupported, or untraceable backlog items as backlog_quality, duplicate, or traceability.
-
-6. Task Clarity and Duplicates
-- Each implementation task must have a clear, actionable title and description.
-- Each task must be small enough for one team to execute.
-- Each task must have exactly one assignee_team.
-- assignee_team must match the actual task domain.
-- Tasks must not overlap significantly.
-- Tasks must not be generic placeholders such as:
-  - "implement backend"
-  - "build frontend"
-  - "create API"
-  - "write tests"
-  unless concrete behavior and verification targets are clear.
-- Report vague, duplicated, too broad, wrong-team, or non-actionable tasks as task_clarity or duplicate.
-
-7. Traceability
+5. Traceability
 - story_id must use US-001 format.
 - backlog_item_id must use BL-001 format.
 - task_id must use TASK-001 format.
-- Backlog related_user_story_ids must reference existing story ids.
-- Task related_user_story_ids must reference existing story ids.
-- Task related_backlog_item_ids must reference existing backlog item ids.
-- Traceability must be explicit through ids.
-- Do not infer traceability from similar wording.
-- Report missing, invalid, duplicate, or unknown ids as traceability or schema_compliance.
+- Backlog related_user_story_ids must reference existing story IDs.
+- Task related_user_story_ids must reference existing story IDs.
+- Task related_backlog_item_ids must reference existing backlog item IDs.
+- Report missing, invalid, duplicate, or unknown IDs.
 
-8. Acceptance Criteria Quality
-- Acceptance criteria must be specific, testable, observable, and implementation-relevant.
-- Acceptance criteria must be pass/fail verifiable.
-- Acceptance criteria must not be empty strings.
-- Acceptance criteria must not be subjective unless measurable.
-- Acceptance criteria must not add scope beyond the BRD.
-- Acceptance criteria must be relevant to the story or task where they appear.
-- Report vague, subjective, unverifiable, empty, unsupported, or misplaced acceptance criteria as acceptance_criteria.
+6. Acceptance criteria
+- AC must be pass/fail testable.
+- AC should include condition/input, observable behavior, and expected output/state/status.
+- Do not fail merely because a vague word appears.
+- Fail only if the criterion lacks concrete observable verification.
+- Do not fail if the criterion includes exact details such as endpoint, status code, response fields, UI state, DB state, validation rule, measurable threshold, or marker.
 
-9. Required Marker Quality
-- Every implementation task must include required_markers.
-- Each required_marker must be concrete, relevant, and verifiable downstream.
-- Each marker must be snake_case with no spaces.
-- Markers must be checkable through code, unit tests, implementation notes, product clarification output, or included_markers.
-- Report missing, vague, duplicated, malformed, unsupported, or irrelevant markers as marker_quality.
-- Acceptable examples:
-  - input_validation
-  - unit_test_for_invalid_email
-  - role_based_access_check
-  - pagination_supported
-  - empty_state_displayed
-  - api_returns_400_for_invalid_payload
-  - dockerfile_created
-  - migration_created
-  - checkout_test_cases_defined
-  - open_question_documented
-- Unacceptable examples:
-  - good_quality
-  - clean_code
-  - secure
-  - works_correctly
-  - proper_testing
-  - marker with spaces
+7. Required markers
+- Markers must be snake_case, concrete, relevant, and verifiable.
+- Fail missing, malformed, generic, unsupported, or irrelevant markers only when they prevent downstream validation.
+
+8. input_context
+- input_context must be a non-empty dictionary.
+- If input_context is empty, null, or not a dictionary, report schema_compliance.
+- If input_context has fewer than 3 keys but is still useful and concrete, do not block the flow.
 
 Decision rules:
-- If there are no issues, decision must be PASS.
-- If there is any issue, decision must be NEEDS_REVISION.
-- Be strict but fair.
-- Do not invent problems that do not exist.
+- PASS when no blocking issues exist.
+- NEEDS_REVISION when one or more blocking issues exist.
+- If decision is PASS, issues must be [].
+- If decision is NEEDS_REVISION, include only blocking issues.
+- Do not report optional suggestions as issues.
 - Do not generate full replacement stories, backlog items, or tasks.
-- You may recommend revising artifacts, but do not write complete replacements.
-- Do not fail for minor wording differences if downstream agents can act on the artifact.
-- Do not require domains that are not supported by the BRD.
+- Suggestions must be concrete enough for PO to fix in the next retry.
 
-Return only the structured output matching the schema.
-    """.strip(),
-),
-            (
-    "human",
-    f"""
-Review the following PO output for quality.
+Return only the structured output matching the POReviewResult schema.
+"""
+
+
+class POReviewAgent(OpenAIAPIAgent):
+    """
+    PO Review agent — validates PO output before tasks go to DEV.
+
+    This version is convergence-oriented:
+    - only blocks on HIGH/CRITICAL issues,
+    - does not repeat resolved previous issues,
+    - does not use minor suggestions as retry triggers.
+    """
+
+    def review(
+        self,
+        brd_content: str,
+        feature_summary: str,
+        user_stories: list[dict],
+        backlog_items: list[dict],
+        implementation_tasks: list[dict],
+        previous_issues: list[dict] | None = None,
+    ) -> POReviewResult:
+        structured_llm = self.llm.with_structured_output(
+            POReviewResult,
+            method="function_calling",
+        )
+
+        brd_text = brd_content or ""
+        stories_json = to_pretty_json(user_stories or [])
+        backlog_json = to_pretty_json(backlog_items or [])
+        tasks_json = to_pretty_json(implementation_tasks or [])
+
+        # Important:
+        # Reviewer should only see previous blocking issues for convergence.
+        # Do not load all old LOW/MEDIUM history into review context.
+        active_previous_issues = filter_active_po_issues(previous_issues or [])
+
+        history_block = ""
+        if active_previous_issues:
+            history_block = "\n### PREVIOUS ACTIVE BLOCKING ISSUES\n"
+            history_block += (
+                "These issues were reported in previous review rounds. "
+                "Use them only to check convergence.\n"
+                "Do not repeat an old issue if the current artifacts have resolved it.\n"
+                "Only report an old issue again if it is still clearly present.\n\n"
+            )
+
+            for idx, issue in enumerate(active_previous_issues, 1):
+                affected_items = issue.get("affected_items", [])
+                history_block += f"{idx}. [{issue.get('category')}] Severity: {issue.get('severity')}\n"
+                history_block += f"   Description: {issue.get('description')}\n"
+                history_block += f"   Affected: {', '.join(affected_items)}\n"
+                history_block += f"   Previous suggestion: {issue.get('suggestion')}\n\n"
+
+        human_prompt = f"""
+Review the following PO output for delivery readiness.
 
 Instructions:
-- Base your review only on the provided artifacts.
-- Do not assume missing context.
-- Validate schema compliance.
-- Validate explicit traceability.
-- Validate domain coverage based on the BRD.
-- If the BRD clearly includes multiple implementation domains, verify that tasks are not incorrectly collapsed into backend only.
-- If the BRD includes frontend, data/database, devops/platform, QA, product clarification, security, mobile, or design work, verify that BRD-supported domains are represented by appropriate tasks.
-- If the BRD includes open questions, verify they are represented as product clarification work or explicit assumptions.
-- Validate acceptance criteria quality.
-- Validate required_markers quality.
-- If evidence is insufficient, say so in the issue description.
-- Every issue must include a concrete suggestion.
-- Return only the structured output.
+- Base your review only on the provided BRD and PO artifacts.
+- Return NEEDS_REVISION only for blocking issues.
+- If only minor/non-blocking issues exist, return PASS with issues = [].
+- Do not require unsupported scope.
+- Do not fail explicit minimal assumptions that are aligned with the BRD.
+- Accept product clarification tasks for unresolved BRD questions.
+- On retry, do not repeat previous issues that have been resolved.
+- Every returned issue must be specific, blocking, and actionable.
 
 <BRD>
 {brd_text}
 </BRD>
+
+{history_block}
+
+### PO ARTIFACTS TO REVIEW
 
 <FEATURE_SUMMARY>
 {feature_summary}
@@ -669,10 +922,37 @@ Instructions:
 <IMPLEMENTATION_TASKS>
 {tasks_json}
 </IMPLEMENTATION_TASKS>
-    """.strip(),
-),
+        """.strip()
+
+        messages = [
+            ("system", PO_REVIEW_SYSTEM_PROMPT.strip()),
+            ("human", human_prompt),
         ]
-        return invoke_structured_with_retry(structured_llm, messages)
+
+        result = invoke_structured_with_retry(structured_llm, messages)
+
+        # Safety normalization:
+        # If the model returns NEEDS_REVISION with only LOW/MEDIUM issues,
+        # convert it to PASS to avoid retry loops caused by non-blocking suggestions.
+        try:
+            result_dict = result.model_dump(mode="json")
+            issues = result_dict.get("issues", []) or []
+            blocking_issues = filter_active_po_issues(issues)
+
+            if not blocking_issues:
+                result_dict["decision"] = "PASS"
+                result_dict["issues"] = []
+                return POReviewResult(**result_dict)
+
+            # Keep only blocking issues.
+            result_dict["decision"] = "NEEDS_REVISION"
+            result_dict["issues"] = blocking_issues
+            return POReviewResult(**result_dict)
+
+        except Exception:
+            # If normalization fails, return the original structured result.
+            # The structured output retry above already validated schema.
+            return result
 
 
 class DevAgent(OpenAIAPIAgent):
@@ -765,7 +1045,7 @@ Valid DevResult shape example:
     }
   ],
   "implementation_notes": "Implemented the add function and verified it with unit tests.",
-  "included_markers": ["unit_tested"],
+  "included_markers": ["calculator_add_unit_test_covers_positive_numbers"],
   "known_limitations": []
 }
 
@@ -797,7 +1077,7 @@ Invalid DevResult shape examples:
 Task implementation rules:
 - Implement only the provided task scope.
 - Do not expand into unrelated features.
-- Do not implement product clarification tasks as code. If the task assignee_team is product, return a documentation-style artifact such as "docs/product_decisions/<task_id>.md" with the clarification content required by the task.
+- Do not implement product clarification tasks as code. If the task assignee_team is product, return a documentation-style artifact such as "docs/product_decisions/<task_id>.md" with the clarification content required by the task. For product clarification tasks, do not invent the final business decision unless the task input_context explicitly provides it. Document the decision needed, options, impacted artifacts, and blocked implementation scope.
 - If the task assignee_team is qa, return a QA artifact such as "tests/manual/<task_id>_test_plan.md" or automated test files if appropriate.
 - If the task assignee_team is devops or platform, return infrastructure/config files appropriate to the task.
 - If the task assignee_team is data, return migrations, schema files, seed files, or data-layer files appropriate to the task.

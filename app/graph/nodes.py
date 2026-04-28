@@ -3,8 +3,8 @@ from copy import deepcopy
 import os
 from pathlib import Path
 
-from app.agents.base import DevResult
-from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent
+from app.agents.base import DevResult, POResult
+from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent, to_plain_dict, validate_po_result_locally, filter_active_po_issues
 from app.core.enums import AgentName, TaskStatus, WorkflowStatus
 from app.graph.state import WorkflowState
 from app.services.orchestrator_service import OrchestratorService
@@ -85,22 +85,30 @@ class WorkflowNodes:
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.PO_ANALYZING.value, AgentName.PO.value, 'PO agent is analyzing BRD.')
         self._check_cancelled(updated['workflow_id'])
         
-        # Extract feedback if this is a retry
-        review_result = updated.get('po_review_result') or {}
-        review_issues = review_result.get('issues', [])
+        # Extract active feedback for the PO Agent.
+        # We only pass ACTIVE BLOCKING issues to the PO agent for fixing.
+        # Historical issues are kept in po_review_issues_history for the Reviewer's convergence check.
+        latest_review = updated.get('po_review_result') or {}
+        active_review_issues = latest_review.get('issues', []) if latest_review.get('decision') == 'NEEDS_REVISION' else []
+        local_issues = updated.get('po_local_issues', [])
+        
+        all_active_issues = [*active_review_issues, *local_issues]
+
         previous_po_result = updated.get('po_result')
 
         self.orchestrator.ctx.session.commit() # End transaction before long LLM call
         result = self.po_agent.analyze(
             brd_content=updated['brd_content'],
             previous_result=previous_po_result,
-            review_issues=review_issues
+            review_issues=all_active_issues
         )
         self.orchestrator.ctx.brd_repo.create_feature(updated['workflow_id'], result.feature_summary)
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.PO.value, 'SUCCESS', input_payload={'brd_id': updated['brd_id']}, output_payload=result.model_dump())
         self.orchestrator.ctx.session.commit()
         updated['feature_summary'] = result.feature_summary
         updated['po_result'] = result.model_dump()
+        updated['po_local_issues'] = [] # Clear local issues after they are addressed
+        updated['po_review_result'] = None # Clear stale review result
         updated['current_agent'] = AgentName.PO.value
         updated['status'] = WorkflowStatus.PO_ANALYZING.value
         self._log_node_exit('po_analyze_brd', updated)
@@ -156,6 +164,51 @@ class WorkflowNodes:
         self._log_node_exit('po_create_backlog_and_tasks', updated)
         return updated
 
+    def po_local_validate(self, state: WorkflowState) -> WorkflowState:
+        """Perform rule-based validation on PO result before calling the LLM reviewer."""
+        self._log_node_enter('po_local_validate', state)
+        updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'po_local_validate']
+        
+        po_result_dict = updated.get('po_result')
+        if not po_result_dict:
+            return updated
+            
+        try:
+            po_result = POResult.model_validate(po_result_dict)
+            local_issues = validate_po_result_locally(po_result)
+            blocking_issues = filter_active_po_issues(local_issues)
+            updated['po_local_issues'] = blocking_issues
+            
+            if blocking_issues:
+                WorkflowLogger.warning("workflow.po_local_validate.failed",
+                    workflow_id=updated['workflow_id'],
+                    issues_count=len(blocking_issues),
+                    message=f"PO local validation failed with {len(blocking_issues)} blocking issues."
+                )
+                updated['po_review_retries'] = updated.get('po_review_retries', 0) + 1
+            else:
+                WorkflowLogger.info("workflow.po_local_validate.passed",
+                    workflow_id=updated['workflow_id'],
+                    message="PO local validation passed."
+                )
+        except Exception as exc:
+            WorkflowLogger.error("workflow.po_local_validate.error",
+                workflow_id=updated['workflow_id'],
+                error=str(exc)
+            )
+            # Treat schema validation error as a local issue to trigger retry
+            updated['po_local_issues'] = [{
+                "category": "schema_compliance",
+                "severity": "HIGH",
+                "description": f"Pydantic validation error: {str(exc)}",
+                "suggestion": "Fix the JSON structure to match the required schema."
+            }]
+            updated['po_review_retries'] = updated.get('po_review_retries', 0) + 1
+
+        self._log_node_exit('po_local_validate', updated)
+        return updated
+
     # ──────────────────────────────────────────────────────────────────────
     #  PO Review Gate (validation before persistence)
     # ──────────────────────────────────────────────────────────────────────
@@ -185,7 +238,7 @@ class WorkflowNodes:
 
         po_result = updated.get('po_result') or {}
 
-        # Run the review agent
+        # Run the review agent with history for convergence
         self.orchestrator.ctx.session.commit() # End transaction before long LLM call
         review_result = self.po_review_agent.review(
             brd_content=updated['brd_content'],
@@ -193,10 +246,21 @@ class WorkflowNodes:
             user_stories=po_result.get('user_stories', []),
             backlog_items=po_result.get('backlog_items', []),
             implementation_tasks=po_result.get('implementation_tasks', []),
+            previous_issues=updated.get('po_review_issues_history', []),
         )
 
         review_dict = review_result.model_dump()
         updated['po_review_result'] = review_dict
+        
+        # Accumulate issues into history if revision is needed
+        if review_dict.get('decision') == 'NEEDS_REVISION':
+            new_issues = review_dict.get('issues', [])
+            blocking_new_issues = filter_active_po_issues(new_issues)
+            updated['po_review_issues_history'] = [
+                *updated.get('po_review_issues_history', []),
+                *blocking_new_issues
+            ]
+        
         updated['current_agent'] = AgentName.PO_REVIEW.value
 
         # Record the review run in audit trail

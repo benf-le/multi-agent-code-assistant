@@ -30,3 +30,5 @@ class WorkflowState(TypedDict, total=False):
     loop_signatures: list[str]
     visited_nodes: list[str]
     route_decisions: list[dict[str, Any]]
+    po_local_issues: list[dict[str, Any]]
+    po_review_issues_history: list[dict[str, Any]]

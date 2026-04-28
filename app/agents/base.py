@@ -15,7 +15,7 @@ class Priority(StrEnum):
     LOW = "LOW"
     MEDIUM = "MEDIUM"
     HIGH = "HIGH"
-    CRITICAL = "CRITICAL"
+
 
 
 class Severity(StrEnum):
@@ -81,6 +81,24 @@ _ID_PATTERNS = {
 
 _MARKER_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
 
+GENERIC_MARKERS_BLACKLIST = {
+    "api_endpoint_created",
+    "request_validation",
+    "input_validation",
+    "cache_invalidated",
+    "data_persistence_verified",
+    "logging_configured",
+    "tests_added",
+    "unit_tested",
+    "migration_created",
+    "seed_data_created",
+    "index_created",
+    "secure",
+    "works_correctly",
+    "backend_done",
+    "frontend_done",
+}
+
 
 def _clean_text(value: str, field_name: str = "value") -> str:
     if not isinstance(value, str):
@@ -116,7 +134,7 @@ class StrictArtifactModel(BaseModel):
     """
 
     model_config = {
-        "extra": "ignore",
+        "extra": "forbid",
         "str_strip_whitespace": True,
         "validate_assignment": True,
     }
@@ -266,8 +284,34 @@ class TaskOut(StrictArtifactModel):
     )
     input_context: dict[str, Any] = Field(
         default_factory=dict,
-        description="Optional machine-readable context for downstream DEV agent."
+        description="Required non-empty machine-readable context for downstream DEV agent."
     )
+
+    @field_validator("input_context")
+    @classmethod
+    def validate_input_context(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(value, dict):
+            raise ValueError("input_context must be a dictionary")
+        if len(value) < 3:
+            raise ValueError("input_context must contain at least 3 concrete keys")
+
+        # Allow empty lists/dicts for specific keys that commonly have no items
+        keys_allowing_empty = {
+            "dependencies",
+            "out_of_scope",
+            "expected_inputs",
+            "expected_outputs",
+            "open_questions",
+        }
+
+        for k, v in value.items():
+            if not str(k).strip():
+                raise ValueError("input_context contains empty key")
+            # Only block if value is truly null/empty-string, OR if it's empty list/dict AND not in allowed set
+            if v in (None, "") or (not v and k not in keys_allowing_empty):
+                raise ValueError(f"input_context key '{k}' has invalid empty value: {v}")
+
+        return value
 
     @field_validator("task_id")
     @classmethod
@@ -314,6 +358,13 @@ class TaskOut(StrictArtifactModel):
             raise ValueError(
                 f"invalid required_markers: {invalid}. "
                 "Markers must be snake_case identifiers with no spaces."
+            )
+
+        generic = [v for v in values if v in GENERIC_MARKERS_BLACKLIST]
+        if generic:
+            raise ValueError(
+                f"Banned generic markers found: {generic}. "
+                "Please use specific markers like 'user_login_api_returns_401_for_invalid_password'."
             )
         return values
 
@@ -431,9 +482,10 @@ class POReviewIssue(StrictArtifactModel):
     @field_validator("suggestion")
     @classmethod
     def validate_suggestion(cls, value: str) -> str:
-        if value is None:
-            return ""
-        return value.strip()
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("suggestion cannot be empty. Provide actionable steps to fix the issue.")
+        return cleaned
 
 
 class POReviewResult(StrictArtifactModel):
@@ -593,6 +645,11 @@ class DevResult(StrictArtifactModel):
                 f"invalid included_markers: {invalid}. "
                 "Markers must be snake_case identifiers with no spaces."
             )
+
+        generic = [v for v in values if v in GENERIC_MARKERS_BLACKLIST]
+        if generic:
+            raise ValueError(f"Banned generic markers found in included_markers: {generic}")
+
         return values
 
     @field_validator("known_limitations")
@@ -602,8 +659,9 @@ class DevResult(StrictArtifactModel):
 
     @model_validator(mode="after")
     def validate_dev_output_has_content(self) -> "DevResult":
-        if not self.files:
-            raise ValueError("DevResult must include at least one implementation file")
+        # Allow task with only files, only unit_tests, or both.
+        if not self.files and not self.unit_tests:
+            raise ValueError("DevResult must include at least one implementation file or unit test file")
 
         return self
 
