@@ -522,6 +522,11 @@ Priority 1 — Must obey:
 7. Every backlog item must reference at least one existing user story.
 8. Every implementation task must reference at least one existing user story and one existing backlog item.
 9. Do not collapse all work into backend unless the BRD truly only describes backend/internal service work.
+10. MANDATORY FIRST TASK: The very first task (TASK-001) MUST be 'Project Foundation: Codebase Structure and README'.
+    - This task's goal is to establish the project's file structure and create a comprehensive `readme.md`.
+    - The `readme.md` MUST contain: Project overview, architectural decisions, technology stack, directory structure, and instructions for subsequent tasks to maintain consistency.
+    - This task MUST be assigned to the `devops` or `backend` team.
+    - All subsequent implementation tasks MUST refer to this foundation to avoid fragmented code.
 
 Priority 2 — Quality bar:
 1. User stories must include actor, goal, and value.
@@ -962,6 +967,7 @@ class DevAgent(OpenAIAPIAgent):
         task: dict,
         acceptance_criteria: list[str],
         bug_reports: list[dict] | None = None,
+        project_context: str | None = None,
     ) -> DevResult:
         structured_llm = self.llm.with_structured_output(
             DevResult,
@@ -976,6 +982,10 @@ class DevAgent(OpenAIAPIAgent):
         task_json = to_pretty_json(task_data)
         ac_json = to_pretty_json(ac_data)
         bugs_json = to_pretty_json(bugs_data)
+        
+        context_block = ""
+        if project_context:
+            context_block = f"\n### PROJECT CONTEXT (README.md)\n{project_context}\n"
 
         messages = [
            (
@@ -1003,6 +1013,8 @@ Core principles:
 5. If a detail is ambiguous, make the smallest reasonable assumption and document it in implementation_notes.
 6. Prefer simple, maintainable, production-like code over over-engineered solutions.
 7. Your output must be suitable for QC validation.
+8. Contextual Awareness: Before implementing any code, read the task's `input_context` and the project's overall context provided in the PO output. This contains the strategic intent of the project.
+9. Project Consistency: If a `readme.md` or a project foundation exists (provided in the context), you MUST follow its rules, directory structure, and architectural patterns. Do not create 'detached' or 'fragmented' code. Always ensure your code integrates correctly into the existing project path.
 
 Schema compliance rules:
 - Return only fields defined by the DevResult schema.
@@ -1116,6 +1128,8 @@ Implement the task below.
 {bugs_json}
 </BUG_REPORTS>
 
+{context_block}
+
 Instructions:
 - Return only the structured output matching the DevResult schema.
 - Ensure task_id matches the task.
@@ -1138,6 +1152,7 @@ class QCAgent(OpenAIAPIAgent):
         task: dict,
         acceptance_criteria: list[str],
         dev_output: dict,
+        project_context: str | None = None,
     ) -> QCResult:
         structured_llm = self.llm.with_structured_output(
             QCResult,
@@ -1158,6 +1173,10 @@ class QCAgent(OpenAIAPIAgent):
         ac_json = to_pretty_json(ac_data)
         dev_output_json = to_pretty_json(dev_output_data)
 
+        context_block = ""
+        if project_context:
+            context_block = f"\n### PROJECT CONTEXT (README.md)\n{project_context}\n"
+
         messages = [
             (
                 "system",
@@ -1172,13 +1191,15 @@ You will receive:
 1. TASK
 2. ACCEPTANCE_CRITERIA
 3. DEVELOPER_OUTPUT
+4. PROJECT CONTEXT (README.md) - if available
 
 Core principles:
 1. Be evidence-based.
 2. Evaluate every acceptance criterion individually.
 3. Evaluate every required marker individually.
-4. Use only provided task context, acceptance criteria, developer files, unit tests, implementation notes, included_markers, and known_limitations.
-5. If there is no clear evidence that a criterion is satisfied, mark it as UNSUPPORTED or FAILED.
+4. Use only provided task context, acceptance criteria, developer files, unit tests, implementation notes, included_markers, known_limitations, and the project context (README.md).
+5. Ensure the implementation is consistent with the project foundation, directory structure, and architectural goals defined in the README.
+6. If there is no clear evidence that a criterion is satisfied, mark it as UNSUPPORTED or FAILED.
 6. Do not assume hidden behavior exists.
 7. Do not fail the implementation for requirements that were never explicitly requested.
 8. Feedback must be specific, actionable, and suitable for sending back to the developer.
@@ -1349,6 +1370,8 @@ Instructions:
 <DEVELOPER_OUTPUT>
 {dev_output_json}
 </DEVELOPER_OUTPUT>
+
+{context_block}
                 """.strip(),
             ),
         ]

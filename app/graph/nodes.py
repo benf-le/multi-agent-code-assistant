@@ -428,11 +428,26 @@ class WorkflowNodes:
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV started implementation for {task_display}.")
         self._check_cancelled(updated['workflow_id'])
         bug_reports = self.orchestrator.ctx.task_repo.list_bugs_for_task(current_task['id'])
+        # Try to read project context (README.md) from the physical files
+        project_context = None
+        try:
+            project_dir = Path("generated_code") / f"wf_{updated['workflow_id']}" / "project"
+            readme_file = project_dir / "readme.md"
+            if not readme_file.exists():
+                # Fallback to uppercase README.md
+                readme_file = project_dir / "README.md"
+            
+            if readme_file.exists():
+                project_context = readme_file.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"[wf_{updated['workflow_id']}] Error reading project context: {e}")
+
         self.orchestrator.ctx.session.commit() # End transaction before long LLM call
         dev_result = self.dev_agent.implement(
             task=current_task,
             acceptance_criteria=current_task['acceptance_criteria'],
             bug_reports=[{'id': b.id, 'title': b.title, 'description': b.description, 'failed_criteria': b.failed_criteria} for b in bug_reports],
+            project_context=project_context,
         )
         output_payload = dev_result.model_dump()
         db_task = self.orchestrator.ctx.task_repo.get_task(current_task['id'])
@@ -516,8 +531,22 @@ class WorkflowNodes:
         updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'qc_validate']
         current_task = updated['current_task']
         self._check_cancelled(updated['workflow_id'])
+        # Try to read project context (README.md) from the physical files
+        project_context = None
+        try:
+            project_dir = Path("generated_code") / f"wf_{updated['workflow_id']}" / "project"
+            readme_file = project_dir / "readme.md"
+            if not readme_file.exists():
+                # Fallback to uppercase README.md
+                readme_file = project_dir / "README.md"
+            
+            if readme_file.exists():
+                project_context = readme_file.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"[wf_{updated['workflow_id']}] Error reading project context: {e}")
+
         self.orchestrator.ctx.session.commit() # End transaction before long LLM call
-        qc_result = self.qc_agent.validate(current_task, current_task['acceptance_criteria'], updated['dev_output'] or {})
+        qc_result = self.qc_agent.validate(current_task, current_task['acceptance_criteria'], updated['dev_output'] or {}, project_context=project_context)
         task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.QC.value, 'SUCCESS', task_id=current_task['id'], input_payload={'task': current_task, 'dev_output': updated.get('dev_output')}, output_payload=qc_result.model_dump())
         self.orchestrator.update_workflow_status(updated['workflow_id'], qc_result.status, AgentName.QC.value, f"QC validated task {task_display}: {qc_result.status}", task_id=current_task['id'])
