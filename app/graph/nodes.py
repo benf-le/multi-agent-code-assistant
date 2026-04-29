@@ -5,6 +5,11 @@ from pathlib import Path
 
 from app.agents.base import DevResult, POResult
 from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent, to_plain_dict, validate_po_result_locally, filter_active_po_issues
+from app.agents.project_utils import (
+    apply_dev_result_to_project,
+    assert_required_foundation_files,
+    extract_project_context_from_current_project,
+)
 from app.core.enums import AgentName, TaskStatus, WorkflowStatus
 from app.graph.state import WorkflowState
 from app.services.orchestrator_service import OrchestratorService
@@ -441,7 +446,10 @@ class WorkflowNodes:
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_IN_PROGRESS.value, AgentName.DEV.value, f"DEV started implementation for {task_display}.")
         self._check_cancelled(updated['workflow_id'])
         bug_reports = self.orchestrator.ctx.task_repo.list_bugs_for_task(current_task['id'])
-        project_context = self._read_project_context(updated['workflow_id'])
+
+        # Build project context from current_project (in-memory state)
+        current_project = updated.get('current_project', {})
+        project_context = extract_project_context_from_current_project(current_project) or self._read_project_context(updated['workflow_id'])
 
         self.orchestrator.ctx.session.commit() # End transaction before long LLM call
         dev_result = self.dev_agent.implement(
@@ -449,6 +457,7 @@ class WorkflowNodes:
             acceptance_criteria=current_task['acceptance_criteria'],
             bug_reports=[{'id': b.id, 'title': b.title, 'description': b.description, 'failed_criteria': b.failed_criteria} for b in bug_reports],
             project_context=project_context,
+            current_project_snapshot=current_project,
         )
         output_payload = dev_result.model_dump()
         db_task = self.orchestrator.ctx.task_repo.get_task(current_task['id'])
@@ -462,6 +471,11 @@ class WorkflowNodes:
         
         # Save physical files
         self._save_physical_files(updated['workflow_id'], current_task, dev_result)
+
+        # Build candidate_project by applying DevResult to current_project.
+        # Do NOT commit to current_project yet — QC must validate first.
+        candidate_project = apply_dev_result_to_project(current_project, dev_result)
+        updated['candidate_project'] = candidate_project
 
         updated['current_task'] = current_task
         updated['dev_output'] = output_payload
@@ -532,10 +546,19 @@ class WorkflowNodes:
         updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'qc_validate']
         current_task = updated['current_task']
         self._check_cancelled(updated['workflow_id'])
-        project_context = self._read_project_context(updated['workflow_id'])
+
+        # Use candidate_project (after applying DevResult) for QC validation.
+        candidate_project = updated.get('candidate_project', {})
+        project_context = extract_project_context_from_current_project(candidate_project) or self._read_project_context(updated['workflow_id'])
 
         self.orchestrator.ctx.session.commit() # End transaction before long LLM call
-        qc_result = self.qc_agent.validate(current_task, current_task['acceptance_criteria'], updated['dev_output'] or {}, project_context=project_context)
+        qc_result = self.qc_agent.validate(
+            task=current_task,
+            acceptance_criteria=current_task['acceptance_criteria'],
+            dev_output=updated['dev_output'] or {},
+            project_context=project_context,
+            current_project_snapshot=candidate_project,
+        )
         task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.QC.value, 'SUCCESS', task_id=current_task['id'], input_payload={'task': current_task, 'dev_output': updated.get('dev_output')}, output_payload=qc_result.model_dump())
         self.orchestrator.update_workflow_status(updated['workflow_id'], qc_result.status, AgentName.QC.value, f"QC validated task {task_display}: {qc_result.status}", task_id=current_task['id'])
@@ -585,12 +608,31 @@ class WorkflowNodes:
         return updated
 
     def mark_task_done(self, state: WorkflowState) -> WorkflowState:
-        """Mark the current task as DONE. Does NOT advance to the next task."""
+        """Mark the current task as DONE. Does NOT advance to the next task.
+
+        Commits candidate_project to current_project now that QC has passed.
+        Refreshes project_context from the updated project state.
+        """
         self._log_node_enter('mark_task_done', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
         updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'mark_task_done']
         current_task = self.orchestrator.serialize_task(updated['current_task']['id'])
+
+        # Commit candidate_project → current_project (QC passed)
+        candidate = updated.get('candidate_project', {})
+        if candidate:
+            updated['current_project'] = candidate
+            updated['candidate_project'] = {}
+
+            # Assert foundation files after TASK-001
+            task_id = current_task.get('task_id', '')
+            if task_id == 'TASK-001' or current_task.get('task_number') == 1:
+                try:
+                    assert_required_foundation_files(updated['current_project'])
+                except ValueError as exc:
+                    print(f"[wf_{updated['workflow_id']}] Foundation warning: {exc}")
+
         updated['completed_tasks'] = [*updated.get('completed_tasks', []), current_task]
         updated['task_history'] = [*updated.get('task_history', []), current_task]
         updated['current_task'] = None
@@ -602,7 +644,11 @@ class WorkflowNodes:
         return updated
 
     def max_retry_exceeded(self, state: WorkflowState) -> WorkflowState:
-        """Mark the current task as BLOCKED due to max retry or loop detection."""
+        """Mark the current task as BLOCKED due to max retry or loop detection.
+
+        Even though QC failed, commit the best available candidate_project
+        so subsequent tasks have the latest state to work with.
+        """
         self._log_node_enter('max_retry_exceeded', state)
         self._check_cancelled(state['workflow_id'])
         updated = deepcopy(state)
@@ -621,6 +667,13 @@ class WorkflowNodes:
                 reason = f"Task {task_display} exceeded max retry limit."
         else:
             reason = f"Task {task_display} exceeded max retry limit."
+
+        # Commit best available candidate even though QC failed,
+        # so subsequent tasks have the latest state.
+        candidate = updated.get('candidate_project', {})
+        if candidate:
+            updated['current_project'] = candidate
+            updated['candidate_project'] = {}
 
         self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.MAX_RETRY_EXCEEDED.value, AgentName.ORCHESTRATOR.value, reason, task_id=current_task['id'])
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.BLOCKED.value, AgentName.ORCHESTRATOR.value, f"Max retry exceeded for {task_display}. Task blocked.")

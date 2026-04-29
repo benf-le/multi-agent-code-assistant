@@ -196,6 +196,8 @@ class WorkflowService:
             'loop_signatures': [],
             'visited_nodes': [],
             'route_decisions': [],
+            'current_project': {},
+            'candidate_project': {},
         }
 
     def _build_task_state(self, orchestrator: OrchestratorService, workflow, brd, task_dict: dict) -> WorkflowState:
@@ -230,6 +232,8 @@ class WorkflowService:
             'loop_signatures': [],
             'visited_nodes': [],
             'route_decisions': [],
+            'current_project': {},
+            'candidate_project': {},
         }
 
     # ──────────────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@ import json
 from typing import Any
 from langchain_openai import ChatOpenAI
 from app.agents.base import POResult, POReviewResult, DevResult, QCResult, GENERIC_MARKERS_BLACKLIST
+from app.agents.serialization_utils import to_plain_dict, to_pretty_json  # noqa: F401 — re-exported
 from pydantic import ValidationError
 
 # ============================================================
@@ -77,11 +78,23 @@ DevResult rules:
 - If there are no unit tests, use "unit_tests": [].
 - included_markers must be snake_case with no spaces.
 - known_limitations must be a list of strings. Use [] if none.
+- For non-foundation tasks, do not create a standalone project.
+- Follow PROJECT CONTEXT and CURRENT_PROJECT_SNAPSHOT.
+- Return complete contents only for changed files.
+- Preserve existing behavior when modifying files.
+- If a file is modified, include the full updated file content.
+- Do not omit existing imports/routes/tests from modified files unless explicitly required.
+- If adding a dependency, update dependency file.
+- If changing architecture, commands, contracts, or directory structure, update README.md and project_context.json.
+- Do not create duplicate entrypoints or alternate frameworks.
 
 QCResult rules:
 - passed/status/failed_criteria must be internally consistent.
 - If passed is true, status must be PASSED and failed_criteria must be empty.
 - If passed is false, status must be FAILED or NEEDS_REVISION.
+- Validate against CURRENT_PROJECT_SNAPSHOT_AFTER_TASK when provided.
+- If passed is true, all criteria and markers must be PASSED.
+- If integration into snapshot is missing, passed must be false.
 
 Return only the corrected structured output.
                     """.strip(),
@@ -89,38 +102,6 @@ Return only the corrected structured output.
             ]
 
     raise last_error
-
-
-def to_pretty_json(data) -> str:
-    """Convert data to a pretty-printed JSON string for prompts."""
-    if hasattr(data, "model_dump"):
-        data = data.model_dump(mode="json")
-    elif isinstance(data, list):
-        data = [
-            item.model_dump(mode="json") if hasattr(item, "model_dump") else item
-            for item in data
-        ]
-    elif isinstance(data, dict):
-        data = {
-            key: value.model_dump(mode="json") if hasattr(value, "model_dump") else value
-            for key, value in data.items()
-        }
-
-    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
-
-
-def to_plain_dict(obj: Any) -> Any:
-    """Recursively convert Pydantic models or lists/dicts of them to plain dicts."""
-    if hasattr(obj, "model_dump"):
-        return obj.model_dump(mode="json")
-
-    if isinstance(obj, list):
-        return [to_plain_dict(item) for item in obj]
-
-    if isinstance(obj, dict):
-        return {k: to_plain_dict(v) for k, v in obj.items()}
-
-    return obj
 
 
 # ============================================================
@@ -522,14 +503,19 @@ Priority 1 — Must obey:
 7. Every backlog item must reference at least one existing user story.
 8. Every implementation task must reference at least one existing user story and one existing backlog item.
 9. Do not collapse all work into backend unless the BRD truly only describes backend/internal service work.
-10. MANDATORY FIRST TASK: The very first task (TASK-001) MUST be 'Project Foundation: Codebase Structure and README'.
-    - This task's goal is to establish the project's file structure and create a comprehensive `readme.md`.
-    - The `readme.md` MUST contain: Project overview, architectural decisions, technology stack, directory structure, and instructions for subsequent tasks to maintain consistency.
-    - The foundation task MUST require the DEV agent to return `README.md` and the minimal project skeleton/codebase files.
-    - Its input_context MUST include project_goal, proposed_tech_stack, directory_structure, readme_required_sections, and future_agent_rules.
+10. MANDATORY FIRST TASK: The very first task (TASK-001) MUST be 'Project Foundation: Codebase Structure, README, and Project Context'.
+    - This task's goal is to establish the project's file structure and create the project contract files.
+    - TASK-001 MUST create all of the following:
+      a. README.md - the human-readable project contract.
+      b. project_context.json - the machine-readable project contract.
+      c. Skeleton project with minimal runnable structure.
+      d. Dependency/config files if appropriate (e.g. requirements.txt, package.json, pyproject.toml, go.mod).
+    - README.md MUST contain these sections: Project overview, Product goal, Tech stack, Directory structure, Entrypoints, Setup commands, Run commands, Test commands, Architecture rules, Shared contracts, API contracts (if applicable), UI contracts (if applicable), Data contracts (if applicable), File ownership rules, Future task rules, Known assumptions, Out of scope.
+    - project_context.json MUST contain these keys: project_name, stack (with language, framework, test_runner), entrypoints, run_commands (with install, run, test), test_commands, directory_structure (list of paths), architecture_rules (list of rules), shared_contracts, file_ownership_rules (list of rules), task_implementation_rules (list of rules including: do not create standalone project, do not create second entrypoint, do not introduce alternate framework, modify existing files preserving behavior, update README.md and project_context.json when changing commands/structure/contracts), out_of_scope.
+    - TASK-001 input_context MUST include: project_goal, proposed_tech_stack, directory_structure, readme_required_sections, project_context_json_required_keys, future_task_rules.
     - This task MUST be assigned to the `devops` or `backend` team.
     - All subsequent implementation tasks MUST refer to this foundation to avoid fragmented code.
-    - Every subsequent task's input_context MUST include expected_paths or target_modules that align with the README directory structure.
+    - Every subsequent task's input_context MUST include expected_paths or target_modules that align with the README directory structure, integration_notes or affected_existing_files if the task modifies existing files, and dependency_on_project_context set to true.
 
 Priority 2 — Quality bar:
 1. User stories must include actor, goal, and value.
@@ -971,7 +957,10 @@ class DevAgent(OpenAIAPIAgent):
         acceptance_criteria: list[str],
         bug_reports: list[dict] | None = None,
         project_context: str | None = None,
+        current_project_snapshot: dict[str, str] | None = None,
     ) -> DevResult:
+        from app.agents.project_utils import build_project_snapshot_for_prompt
+
         structured_llm = self.llm.with_structured_output(
             DevResult,
             method="function_calling",
@@ -988,7 +977,13 @@ class DevAgent(OpenAIAPIAgent):
         
         context_block = ""
         if project_context:
-            context_block = f"\n### PROJECT CONTEXT (README.md)\n{project_context}\n"
+            context_block = f"\n<PROJECT_CONTEXT>\n{project_context}\n</PROJECT_CONTEXT>\n"
+
+        snapshot_block = ""
+        if current_project_snapshot:
+            safe_snapshot = build_project_snapshot_for_prompt(current_project_snapshot)
+            snapshot_json = to_pretty_json(safe_snapshot)
+            snapshot_block = f"\n<CURRENT_PROJECT_SNAPSHOT>\n{snapshot_json}\n</CURRENT_PROJECT_SNAPSHOT>\n"
 
         messages = [
            (
@@ -1119,6 +1114,40 @@ Markers:
 - Do not include markers merely because they were requested.
 - If a required marker cannot be implemented due to missing context, omit it from included_markers and explain in implementation_notes and known_limitations.
 
+Current project snapshot rules:
+- You are modifying an existing project, not creating a standalone project.
+- CURRENT_PROJECT_SNAPSHOT is the current source of truth for the codebase.
+- Return complete file contents only for files you create or modify.
+- If modifying an existing file, preserve unrelated existing behavior.
+- Do not recreate the project from scratch.
+- Do not delete existing routes, imports, models, tests, configs, or README sections unless the task explicitly requires it.
+- Do not create duplicate app roots, duplicate entrypoints, alternate frameworks, or isolated examples.
+- Do not create files outside the structure defined by README.md and project_context.json unless the task requires a new path and the context allows it.
+- If you add a new API router, component, service, model, or config, update the necessary existing wiring file from CURRENT_PROJECT_SNAPSHOT.
+- If you add a new dependency, update the dependency file such as requirements.txt, package.json, pyproject.toml, go.mod, etc.
+- If you change setup commands, run commands, public API/data/UI contracts, directory structure, or architecture rules, update both README.md and project_context.json.
+- If project_context.json and README.md conflict, prefer project_context.json for machine-readable paths and commands, but update README.md to match.
+
+Foundation/TASK-001 rules:
+- If task_id is TASK-001 or task title indicates codebase setup/project foundation, create README.md, project_context.json, and minimal skeleton project.
+- README.md must be returned as file_path exactly "README.md".
+- project_context.json must be returned as file_path exactly "project_context.json".
+
+Non-foundation task rules:
+- For any task after TASK-001, do not generate a new standalone project.
+- Read PROJECT CONTEXT and CURRENT_PROJECT_SNAPSHOT before choosing file paths.
+- Modify or add only files necessary for the task.
+- Prefer extending existing modules over creating new parallel modules.
+- If required context is missing, document it in known_limitations instead of inventing a new architecture.
+
+Output rules:
+- Return DevResult only.
+- files must contain implementation file objects only.
+- unit_tests must contain test file objects only.
+- Every item in files and unit_tests must be an object with file_path and code.
+- Return complete file content, not diffs.
+- Do not include markdown fences in code fields.
+
 Negative constraints:
 - Do not return markdown code fences in JSON fields.
 - Do not include extra fields.
@@ -1132,7 +1161,7 @@ Return only the structured output matching the schema.
            (
     "human",
     f"""
-Implement the task below.
+Implement this task by modifying the current project snapshot. Do not create an independent project.
 
 <TASK>
 {task_json}
@@ -1148,15 +1177,19 @@ Implement the task below.
 
 {context_block}
 
+{snapshot_block}
+
 Instructions:
 - Return only the structured output matching the DevResult schema.
 - Ensure task_id matches the task.
-- Before implementing, use PROJECT CONTEXT (README.md) when provided to keep paths, architecture, API/data contracts, and setup commands consistent.
-- If this is the foundation/first task, include `README.md` and the initial project skeleton/codebase in files.
-- If this task changes shared project context, include an updated `README.md` in files.
+- Read PROJECT_CONTEXT and CURRENT_PROJECT_SNAPSHOT before choosing file paths.
+- If this is the foundation/first task (TASK-001), include `README.md`, `project_context.json`, and the initial project skeleton in files.
+- If this task changes shared project context (architecture, commands, contracts, structure), include updated `README.md` and `project_context.json` in files.
+- Implement this task by modifying the current project snapshot. Do not create an independent project.
 - files must contain only implementation file objects.
 - unit_tests must contain only test file objects.
 - Every item in files and unit_tests must be an object with file_path and code.
+- Return complete file content for each file, not diffs.
 - Do not put strings, "unit_tests", "tests", "NULL", "null", "None", or placeholders inside files or unit_tests.
 - If no unit tests are appropriate, use "unit_tests": [].
 - If there are no known limitations, use "known_limitations": [].
@@ -1174,7 +1207,10 @@ class QCAgent(OpenAIAPIAgent):
         acceptance_criteria: list[str],
         dev_output: dict,
         project_context: str | None = None,
+        current_project_snapshot: dict[str, str] | None = None,
     ) -> QCResult:
+        from app.agents.project_utils import build_project_snapshot_for_prompt
+
         structured_llm = self.llm.with_structured_output(
             QCResult,
             method="function_calling",
@@ -1196,7 +1232,13 @@ class QCAgent(OpenAIAPIAgent):
 
         context_block = ""
         if project_context:
-            context_block = f"\n### PROJECT CONTEXT (README.md)\n{project_context}\n"
+            context_block = f"\n<PROJECT_CONTEXT>\n{project_context}\n</PROJECT_CONTEXT>\n"
+
+        snapshot_after_task_block = ""
+        if current_project_snapshot:
+            safe_snapshot = build_project_snapshot_for_prompt(current_project_snapshot)
+            snapshot_json = to_pretty_json(safe_snapshot)
+            snapshot_after_task_block = f"\n<CURRENT_PROJECT_SNAPSHOT_AFTER_TASK>\n{snapshot_json}\n</CURRENT_PROJECT_SNAPSHOT_AFTER_TASK>\n"
 
         messages = [
             (
@@ -1352,6 +1394,18 @@ Negative constraints:
 - Do not require infrastructure, deployment config, or unrelated files unless explicitly required.
 - Do not give vague feedback such as "needs improvement" without concrete reasons.
 
+Project snapshot validation:
+- You are validating the task after its output has been applied to the current project snapshot.
+- Validate not only the returned DevResult, but also whether the task is correctly integrated into the project snapshot.
+- Check that new files are wired into existing entrypoints/configs when needed.
+- Check that imports reference files/modules present in CURRENT_PROJECT_SNAPSHOT_AFTER_TASK.
+- Check that tests reference actual modules/functions/classes in the snapshot.
+- Check that README.md and project_context.json remain consistent if the task changed architecture, commands, contracts, or structure.
+- Check that the task did not create a duplicate app root, duplicate entrypoint, alternate framework, or isolated example project.
+- Check that previous project structure was preserved.
+- Do not fail only because code was not executed. This is static validation.
+- If integration evidence is missing, mark the relevant criterion or marker FAILED/UNSUPPORTED with actionable feedback.
+
 Ambiguity handling:
 - If task wording is ambiguous, do not expand scope.
 - Judge only against the narrowest reasonable interpretation supported by the input.
@@ -1371,10 +1425,14 @@ Return only the structured output matching the schema.
             (
                 "human",
                 f"""
-Validate the developer output below.
+Validate the developer output below against the project snapshot after applying the task.
 Instructions:
 - Validate against the provided ACCEPTANCE_CRITERIA.
-- Use only evidence from TASK and DEVELOPER_OUTPUT.
+- Use evidence from TASK, DEVELOPER_OUTPUT, and CURRENT_PROJECT_SNAPSHOT_AFTER_TASK.
+- Check that the task output integrates correctly into the project snapshot.
+- Check that new files are wired into existing entrypoints/configs.
+- Check that imports reference existing files/modules in the snapshot.
+- Check that the task did not create a duplicate app root, entrypoint, or alternate framework.
 - Do not execute code.
 - Do not assume hidden behavior.
 - Produce one criteria_results item for each acceptance criterion.
@@ -1396,6 +1454,8 @@ Instructions:
 </DEVELOPER_OUTPUT>
 
 {context_block}
+
+{snapshot_after_task_block}
                 """.strip(),
             ),
         ]

@@ -2,7 +2,14 @@ from app.agents.base import QCResult
 
 
 class MockQCAgent:
-    def validate(self, task: dict, acceptance_criteria: list[str], dev_output: dict) -> QCResult:
+    def validate(
+        self,
+        task: dict,
+        acceptance_criteria: list[str],
+        dev_output: dict,
+        project_context: str | None = None,
+        current_project_snapshot: dict[str, str] | None = None,
+    ) -> QCResult:
         required_markers = task.get('required_markers', [])
         included_markers = dev_output.get('included_markers', [])
         missing = [marker for marker in required_markers if marker not in included_markers]

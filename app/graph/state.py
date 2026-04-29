@@ -32,3 +32,7 @@ class WorkflowState(TypedDict, total=False):
     route_decisions: list[dict[str, Any]]
     po_local_issues: list[dict[str, Any]]
     po_review_issues_history: list[dict[str, Any]]
+    # Project state — in-memory project tracking
+    current_project: dict[str, str]       # committed/accepted project state
+    candidate_project: dict[str, str]     # temporary state after applying task, used for QC
+

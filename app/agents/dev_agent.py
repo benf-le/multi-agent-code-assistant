@@ -8,6 +8,7 @@ class MockDevAgent:
         acceptance_criteria: list[str],
         bug_reports: list[dict] | None = None,
         project_context: str | None = None,
+        current_project_snapshot: dict[str, str] | None = None,
     ) -> DevResult:
         bug_reports = bug_reports or []
         markers = list(task.get('required_markers', []))
