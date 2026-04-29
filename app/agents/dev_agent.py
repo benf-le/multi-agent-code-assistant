@@ -2,7 +2,13 @@ from app.agents.base import DevResult, ImplementedFile, TestFile
 
 
 class MockDevAgent:
-    def implement(self, task: dict, acceptance_criteria: list[str], bug_reports: list[dict] | None = None) -> DevResult:
+    def implement(
+        self,
+        task: dict,
+        acceptance_criteria: list[str],
+        bug_reports: list[dict] | None = None,
+        project_context: str | None = None,
+    ) -> DevResult:
         bug_reports = bug_reports or []
         markers = list(task.get('required_markers', []))
         expected_failures = int(task.get('input_context', {}).get('expected_failures', 0))

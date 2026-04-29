@@ -554,9 +554,6 @@ class ImplementedFile(StrictArtifactModel):
         if value.startswith("/") or value.startswith("../") or "/../" in value:
             raise ValueError("file_path must be a safe relative path")
 
-        if "/" not in value:
-            raise ValueError("file_path must include a subdirectory, e.g. app/services/foo.py")
-
         return value
 
     @field_validator("code")
@@ -583,9 +580,6 @@ class TestFile(StrictArtifactModel):
 
         if value.startswith("/") or value.startswith("../") or "/../" in value:
             raise ValueError("file_path must be a safe relative path")
-
-        if "/" not in value:
-            raise ValueError("file_path must include a subdirectory, e.g. tests/test_foo.py")
 
         return value
 
