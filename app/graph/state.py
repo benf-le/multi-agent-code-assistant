@@ -18,6 +18,7 @@ class WorkflowState(TypedDict, total=False):
     blocked_tasks: list[dict[str, Any]]
     completed_tasks: list[dict[str, Any]]
     dev_output: dict[str, Any] | None
+    build_result: dict[str, Any] | None
     qc_result: dict[str, Any] | None
     bug_reports: list[dict[str, Any]]
     retry_count: int

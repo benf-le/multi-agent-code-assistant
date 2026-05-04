@@ -50,6 +50,42 @@ def route_by_qc_result(state: WorkflowState) -> str:
     return route
 
 
+def route_by_build_result(state: WorkflowState) -> str:
+    """Route after build verification within a single-task graph run."""
+    build_result = state.get('build_result') or {}
+    current_task = state.get('current_task') or {}
+    task_id = current_task.get('id')
+    retry_count = int(state.get('retry_count', 0))
+    max_retry = int(state.get('max_retry', 0))
+    
+    if build_result.get('passed'):
+        route = 'pass'
+        reason = "Build passed successfully."
+    elif retry_count >= max_retry:
+        route = 'max_retry'
+        reason = f"Build failed and max retries ({max_retry}) reached."
+    else:
+        route = 'retry'
+        reason = "Build failed, retries remain."
+
+    WorkflowLogger.info("workflow.route.build_decision",
+        workflow_id=state.get('workflow_id'),
+        task_id=task_id,
+        task_number=current_task.get('task_number'),
+        route=route,
+        reason=reason,
+        retry_count=retry_count,
+        max_retry=max_retry
+    )
+    
+    state['route_decisions'] = [
+        *state.get('route_decisions', []),
+        {'node': 'build_candidate', 'route': route, 'reason': reason}
+    ]
+
+    return route
+
+
 def route_by_po_review(state: WorkflowState) -> str:
     """Route after PO review validation within the PO phase graph.
 

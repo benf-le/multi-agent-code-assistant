@@ -1,7 +1,7 @@
 from langgraph.graph import END, START, StateGraph
 
 from app.graph.nodes import WorkflowNodes
-from app.graph.router import route_by_qc_result, route_by_po_review
+from app.graph.router import route_by_qc_result, route_by_po_review, route_by_build_result
 from app.graph.state import WorkflowState
 from app.core.logging_helper import WorkflowLogger
 
@@ -18,11 +18,14 @@ class WorkflowGraphFactory:
              └─ fail  → po_review_failed → END
 
     2. **Task graph** — single-task lifecycle with bounded retry cycle:
-       START → dispatch_to_dev → dev_implement → dispatch_to_qc → qc_validate
-              ├─ pass       → mark_task_done      → END
-              ├─ retry      → create_bug           → dispatch_to_dev  (cycle)
-              ├─ max_retry  → max_retry_exceeded   → END
-              └─ loop_block → max_retry_exceeded   → END
+       START → dispatch_to_dev → dev_implement → build_candidate
+              ├─ pass       → dispatch_to_qc → qc_validate
+              │      ├─ pass       → mark_task_done      → END
+              │      ├─ retry      → create_bug           → dispatch_to_dev  (cycle)
+              │      ├─ max_retry  → max_retry_exceeded   → END
+              │      └─ loop_block → max_retry_exceeded   → END
+              ├─ retry      → create_build_bug     → dispatch_to_dev  (cycle)
+              └─ max_retry  → max_retry_exceeded   → END
     """
 
     def __init__(self, nodes: WorkflowNodes):
@@ -113,6 +116,8 @@ class WorkflowGraphFactory:
         graph = StateGraph(WorkflowState)
         graph.add_node('dispatch_to_dev', self.nodes.dispatch_to_dev)
         graph.add_node('dev_implement', self.nodes.dev_implement)
+        graph.add_node('build_candidate', self.nodes.build_candidate)
+        graph.add_node('create_build_bug', self.nodes.create_build_bug)
         graph.add_node('dispatch_to_qc', self.nodes.dispatch_to_qc)
         graph.add_node('qc_validate', self.nodes.qc_validate)
         graph.add_node('create_bug', self.nodes.create_bug)
@@ -121,7 +126,19 @@ class WorkflowGraphFactory:
 
         graph.add_edge(START, 'dispatch_to_dev')
         graph.add_edge('dispatch_to_dev', 'dev_implement')
-        graph.add_edge('dev_implement', 'dispatch_to_qc')
+        graph.add_edge('dev_implement', 'build_candidate')
+
+        graph.add_conditional_edges(
+            'build_candidate',
+            route_by_build_result,
+            {
+                'pass': 'dispatch_to_qc',
+                'retry': 'create_build_bug',
+                'max_retry': 'max_retry_exceeded',
+            },
+        )
+        graph.add_edge('create_build_bug', 'dispatch_to_dev')
+
         graph.add_edge('dispatch_to_qc', 'qc_validate')
 
         graph.add_conditional_edges(
