@@ -49,6 +49,86 @@ def route_by_qc_result(state: WorkflowState) -> str:
 
     return route
 
+def route_by_dependency_result(state: WorkflowState) -> str:
+    """Route after dependency installation within a single-task graph run."""
+    dep_result = state.get('dependency_result') or {}
+    current_task = state.get('current_task') or {}
+    task_id = current_task.get('id')
+    retry_count = int(state.get('retry_count', 0))
+    max_retry = int(state.get('max_retry', 0))
+    
+    if dep_result.get('skipped_gate'):
+        route = 'skip_gate'
+        reason = "Verification gate skipped for foundation task."
+    elif dep_result.get('passed'):
+        route = 'pass'
+        reason = "Dependencies installed or skipped successfully."
+    elif dep_result.get('category') == 'missing_tooling':
+        route = 'max_retry'
+        reason = f"Dependency installation failed due to missing host tooling: {dep_result.get('command')}. Cannot be fixed by DevAgent."
+    elif retry_count >= max_retry:
+        route = 'max_retry'
+        reason = f"Dependency installation failed and max retries ({max_retry}) reached."
+    else:
+        route = 'retry'
+        reason = "Dependency installation failed, retries remain."
+
+    WorkflowLogger.info("workflow.route.dependency_decision",
+        workflow_id=state.get('workflow_id'),
+        task_id=task_id,
+        task_number=current_task.get('task_number'),
+        route=route,
+        reason=reason,
+        retry_count=retry_count,
+        max_retry=max_retry
+    )
+    
+    state['route_decisions'] = [
+        *state.get('route_decisions', []),
+        {'node': 'ensure_dependencies', 'route': route, 'reason': reason}
+    ]
+
+    return route
+
+
+def route_by_build_result(state: WorkflowState) -> str:
+    """Route after build verification within a single-task graph run."""
+    build_result = state.get('build_result') or {}
+    current_task = state.get('current_task') or {}
+    task_id = current_task.get('id')
+    retry_count = int(state.get('retry_count', 0))
+    max_retry = int(state.get('max_retry', 0))
+    
+    if build_result.get('passed'):
+        route = 'pass'
+        reason = "Build passed successfully."
+    elif build_result.get('category') == 'missing_tooling':
+        route = 'max_retry'
+        reason = f"Build failed due to missing host tooling: {build_result.get('command')}. Cannot be fixed by DevAgent."
+    elif retry_count >= max_retry:
+        route = 'max_retry'
+        reason = f"Build failed and max retries ({max_retry}) reached."
+    else:
+        route = 'retry'
+        reason = "Build failed, retries remain."
+
+    WorkflowLogger.info("workflow.route.build_decision",
+        workflow_id=state.get('workflow_id'),
+        task_id=task_id,
+        task_number=current_task.get('task_number'),
+        route=route,
+        reason=reason,
+        retry_count=retry_count,
+        max_retry=max_retry
+    )
+    
+    state['route_decisions'] = [
+        *state.get('route_decisions', []),
+        {'node': 'build_candidate', 'route': route, 'reason': reason}
+    ]
+
+    return route
+
 
 def route_by_po_review(state: WorkflowState) -> str:
     """Route after PO review validation within the PO phase graph.
