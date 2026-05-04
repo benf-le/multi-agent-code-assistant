@@ -2,175 +2,238 @@ import json
 import os
 import subprocess
 from pathlib import Path
+from typing import Dict, Any
 
-def run_build_test(candidate_dir: str, project_context_str: str | None) -> dict:
-    """Run build and test commands on the candidate project.
+def _parse_project_context(project_context_str: str | None) -> dict:
+    if not project_context_str:
+        return {}
+    try:
+        json_str = project_context_str
+        if "## project_context.json" in json_str:
+            parts = json_str.split("## project_context.json")
+            if len(parts) > 1:
+                json_str = parts[1].strip()
+        
+        if json_str.startswith("```json"):
+            json_str = json_str[7:]
+        if json_str.endswith("```"):
+            json_str = json_str[:-3]
+            
+        return json.loads(json_str)
+    except Exception:
+        return {}
 
-    Uses commands defined in project_context.json if available,
-    otherwise attempts basic fallbacks.
+def _detect_language(candidate_path: Path, ctx: dict) -> str:
+    language = ctx.get("stack", {}).get("language", "unknown")
+    if language != "unknown":
+        return language
     
-    Timeout: 180 seconds.
-    """
-    candidate_path = Path(candidate_dir)
-    
-    # 1. Parse project context for commands
-    install_cmd = None
-    build_cmd = None
-    test_cmd = None
-    language = "unknown"
-    
-    if project_context_str:
+    if (candidate_path / "package.json").exists():
+        return "Node.js"
+    if (candidate_path / "requirements.txt").exists() or (candidate_path / "pytest.ini").exists():
+        return "Python"
+    if (candidate_path / "go.mod").exists():
+        return "Go"
+    if list(candidate_path.glob("*.csproj")) or list(candidate_path.glob("*.sln")):
+        return ".NET"
+    if (candidate_path / "pom.xml").exists():
+        return "Java"
+    if (candidate_path / "Cargo.toml").exists():
+        return "Rust"
+    return "unknown"
+
+def _detect_install_cmd(candidate_path: Path, ctx: dict) -> str | None:
+    install_cmd = ctx.get("run_commands", {}).get("install")
+    if install_cmd:
+        return install_cmd
+        
+    if (candidate_path / "package.json").exists():
+        if (candidate_path / "package-lock.json").exists():
+            return "npm ci"
+        return "npm install"
+    if (candidate_path / "requirements.txt").exists():
+        return "pip install -r requirements.txt"
+    if (candidate_path / "pyproject.toml").exists():
+        return "poetry install"
+    if (candidate_path / "go.mod").exists():
+        return "go mod download"
+    if (candidate_path / "Cargo.toml").exists():
+        return "cargo fetch"
+    return None
+
+def _detect_build_cmd(candidate_path: Path, ctx: dict) -> str | None:
+    run_cmds = ctx.get("run_commands", {})
+    build_cmd = run_cmds.get("build")
+    if build_cmd:
+        return build_cmd
+        
+    if (candidate_path / "package.json").exists():
+        # Heuristic: try parsing package.json to see if 'build' script exists
         try:
-            # We assume extract_project_context_from_current_project format:
-            # ## project_context.json
-            # { ... }
-            # Let's extract the JSON part.
-            json_str = project_context_str
-            if "## project_context.json" in json_str:
-                parts = json_str.split("## project_context.json")
-                if len(parts) > 1:
-                    json_str = parts[1].strip()
-            
-            # Simple heuristic if there's markdown code blocks
-            if json_str.startswith("```json"):
-                json_str = json_str[7:]
-            if json_str.endswith("```"):
-                json_str = json_str[:-3]
-                
-            ctx = json.loads(json_str)
-            language = ctx.get("stack", {}).get("language", "unknown")
-            run_cmds = ctx.get("run_commands", {})
-            install_cmd = run_cmds.get("install")
-            build_cmd = run_cmds.get("build")  # Sometimes separate
-            
-            test_cmds_val = ctx.get("test_commands")
-            if isinstance(test_cmds_val, list) and test_cmds_val:
-                test_cmd = test_cmds_val[0]
-            elif isinstance(test_cmds_val, str):
-                test_cmd = test_cmds_val
-                
+            with open(candidate_path / "package.json", "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+                if "scripts" in pkg and "build" in pkg["scripts"]:
+                    return "npm run build"
         except Exception:
             pass
             
-    # 2. Fallbacks if not detected
-    if not test_cmd:
-        if (candidate_path / "package.json").exists():
-            language = "Node.js"
-            install_cmd = install_cmd or "npm install"
-            test_cmd = "npm test"
-        elif (candidate_path / "requirements.txt").exists() or (candidate_path / "pytest.ini").exists():
-            language = "Python"
-            install_cmd = install_cmd or "pip install -r requirements.txt"
-            test_cmd = "pytest"
-        elif (candidate_path / "go.mod").exists():
-            language = "Go"
-            test_cmd = "go test ./..."
-        elif list(candidate_path.glob("*.csproj")) or list(candidate_path.glob("*.sln")):
-            language = ".NET"
-            test_cmd = "dotnet test"
-        elif (candidate_path / "pom.xml").exists():
-            language = "Java"
-            test_cmd = "mvn test"
-        elif (candidate_path / "Cargo.toml").exists():
-            language = "Rust"
-            test_cmd = "cargo test"
-            
-    # 3. Execution
-    commands_to_run = []
-    if install_cmd:
-        commands_to_run.append(install_cmd)
-    if build_cmd:
-        commands_to_run.append(build_cmd)
-    if test_cmd:
-        commands_to_run.append(test_cmd)
-        
-    if not commands_to_run:
-        return {
-            "passed": False,
-            "detected_language": language,
-            "command": "none",
-            "exit_code": 1,
-            "stdout": "",
-            "stderr": "No build/test command found in project_context.json and no fallback matched.",
-            "error_summary": "Missing build/test commands",
-        }
-        
-    combined_stdout = ""
-    combined_stderr = ""
-    last_exit_code = 0
-    failed_cmd = ""
-    
+    return None
+
+def run_command(command: str, cwd: Path, timeout: int, phase: str) -> Dict[str, Any]:
     env = os.environ.copy()
-    # Add non-interactive flags where possible
     env["CI"] = "true" 
     
-    for cmd in commands_to_run:
-        try:
-            # We use shell=True for convenience with combined commands like `npm install && npm run build`
-            process = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=candidate_path,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=180,
-                env=env
-            )
-            combined_stdout += f"\\n--- Executed: {cmd} ---\\n{process.stdout}"
-            if process.stderr:
-                combined_stderr += f"\\n--- Executed: {cmd} ---\\n{process.stderr}"
-            
-            last_exit_code = process.returncode
-            if last_exit_code != 0:
-                failed_cmd = cmd
-                break
-        except subprocess.TimeoutExpired as e:
-            last_exit_code = 124 # Common timeout exit code
-            failed_cmd = cmd
-            if e.stdout:
-                if isinstance(e.stdout, bytes):
-                    combined_stdout += f"\\n--- Executed: {cmd} (TIMEOUT) ---\\n{e.stdout.decode('utf-8', errors='replace')}"
-                else:
-                    combined_stdout += f"\\n--- Executed: {cmd} (TIMEOUT) ---\\n{e.stdout}"
-            if e.stderr:
-                if isinstance(e.stderr, bytes):
-                    combined_stderr += f"\\n--- Executed: {cmd} (TIMEOUT) ---\\n{e.stderr.decode('utf-8', errors='replace')}"
-                else:
-                    combined_stderr += f"\\n--- Executed: {cmd} (TIMEOUT) ---\\n{e.stderr}"
-            combined_stderr += "\\nProcess timed out after 180 seconds."
-            break
-        except Exception as e:
-            last_exit_code = 1
-            failed_cmd = cmd
-            combined_stderr += f"\\n--- Executed: {cmd} (ERROR) ---\\nFailed to execute: {str(e)}"
-            break
+    try:
+        process = subprocess.run(
+            command,
+            shell=True,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout,
+            env=env
+        )
+        passed = (process.returncode == 0)
+        return {
+            "passed": passed,
+            "command": command,
+            "phase": phase,
+            "exit_code": process.returncode,
+            "stdout": process.stdout,
+            "stderr": process.stderr,
+            "timeout_expired": False,
+        }
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout.decode('utf-8', errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or "")
+        stderr = e.stderr.decode('utf-8', errors='replace') if isinstance(e.stderr, bytes) else (e.stderr or "")
+        stderr += f"\nProcess timed out after {timeout} seconds."
+        return {
+            "passed": False,
+            "command": command,
+            "phase": phase,
+            "exit_code": 124,
+            "stdout": stdout,
+            "stderr": stderr,
+            "timeout_expired": True,
+        }
+    except Exception as e:
+        return {
+            "passed": False,
+            "command": command,
+            "phase": phase,
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": f"Failed to execute: {str(e)}",
+            "timeout_expired": False,
+        }
 
-    passed = (last_exit_code == 0)
-    
-    # Try to extract common error summaries
-    error_summary = ""
-    if not passed:
-        stderr_lower = combined_stderr.lower()
-        stdout_lower = combined_stdout.lower()
+def classify_failure(result: Dict[str, Any]) -> str:
+    if result["passed"]:
+        return "passed"
         
-        if "module not found" in stderr_lower or "no module named" in stderr_lower or "cannot find module" in stderr_lower:
-            error_summary = "Missing imports or modules"
-        elif "syntaxerror" in stderr_lower or "syntax error" in stderr_lower:
-            error_summary = "Syntax error"
-        elif "timeout" in stderr_lower or last_exit_code == 124:
-            error_summary = "Command timed out (exceeded 180s)"
-        elif "failed" in stdout_lower or "error" in stdout_lower:
-            error_summary = "Tests failed or build error"
-        else:
-            error_summary = "Command returned non-zero exit code"
+    phase = result["phase"]
+    if result["timeout_expired"]:
+        return f"{phase}_timeout"
 
+    stderr_lower = result["stderr"].lower()
+    stdout_lower = result["stdout"].lower()
+    combined_lower = stderr_lower + " " + stdout_lower
+    
+    # Check for missing tooling
+    if "command not found" in stderr_lower or "not recognized as an internal or external command" in stderr_lower:
+        return "missing_tooling"
+
+    if phase == "dependency":
+        return "dependency_install_failed"
+        
+    # Check for missing dependencies during build
+    missing_dep_signals = [
+        "module not found", 
+        "no module named", 
+        "cannot find module",
+        "could not find a version that satisfies the requirement"
+    ]
+    if any(sig in combined_lower for sig in missing_dep_signals):
+        return "missing_dependency"
+        
+    if "syntaxerror" in stderr_lower or "syntax error" in stderr_lower:
+        return "syntax_error"
+        
+    if "typeerror" in stderr_lower or "type error" in stderr_lower:
+        return "type_error"
+        
+    return "build_failed"
+
+def _format_result(results: list[Dict[str, Any]], language: str, default_phase: str) -> dict:
+    if not results:
+        return {
+            "passed": True,
+            "skipped": True,
+            "detected_language": language,
+            "command": "none",
+            "exit_code": 0,
+            "stdout": "",
+            "stderr": "",
+            "category": "passed",
+            "error_summary": "Skipped (no commands)",
+        }
+        
+    failed_result = next((r for r in results if not r["passed"]), None)
+    
+    if failed_result:
+        category = classify_failure(failed_result)
+        return {
+            "passed": False,
+            "skipped": False,
+            "detected_language": language,
+            "command": failed_result["command"],
+            "phase": failed_result["phase"],
+            "exit_code": failed_result["exit_code"],
+            "stdout": failed_result["stdout"][-5000:],
+            "stderr": failed_result["stderr"][-5000:],
+            "category": category,
+            "error_summary": f"{failed_result['phase'].capitalize()} failed: {category}",
+        }
+        
+    # All passed
+    last_res = results[-1]
+    combined_stdout = "\\n".join(f"--- Executed: {r['command']} ---\\n{r['stdout']}" for r in results)
+    combined_stderr = "\\n".join(f"--- Executed: {r['command']} ---\\n{r['stderr']}" for r in results if r['stderr'])
+    
     return {
-        "passed": passed,
+        "passed": True,
+        "skipped": False,
         "detected_language": language,
-        "command": failed_cmd if not passed else commands_to_run[-1],
-        "exit_code": last_exit_code,
-        "stdout": combined_stdout.strip()[-5000:], # keep last 5000 chars to avoid massive logs
-        "stderr": combined_stderr.strip()[-5000:],
-        "error_summary": error_summary,
+        "command": last_res["command"],
+        "phase": last_res["phase"],
+        "exit_code": 0,
+        "stdout": combined_stdout[-5000:],
+        "stderr": combined_stderr[-5000:],
+        "category": "passed",
+        "error_summary": "",
     }
+
+def ensure_dependencies(candidate_dir: str, project_context_str: str | None) -> dict:
+    candidate_path = Path(candidate_dir)
+    ctx = _parse_project_context(project_context_str)
+    language = _detect_language(candidate_path, ctx)
+    install_cmd = _detect_install_cmd(candidate_path, ctx)
+    
+    if not install_cmd:
+        return _format_result([], language, "dependency")
+        
+    res = run_command(install_cmd, candidate_path, 600, "dependency")
+    return _format_result([res], language, "dependency")
+
+def run_build(candidate_dir: str, project_context_str: str | None) -> dict:
+    candidate_path = Path(candidate_dir)
+    ctx = _parse_project_context(project_context_str)
+    language = _detect_language(candidate_path, ctx)
+    build_cmd = _detect_build_cmd(candidate_path, ctx)
+    
+    if not build_cmd:
+        return _format_result([], language, "build")
+        
+    res = run_command(build_cmd, candidate_path, 180, "build")
+    return _format_result([res], language, "build")

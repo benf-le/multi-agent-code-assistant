@@ -16,6 +16,27 @@ from app.services.orchestrator_service import OrchestratorService
 from app.core.logging_helper import WorkflowLogger
 
 
+def should_skip_db_or_migration_check(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+
+    normalized = value.replace("\\", "/").lower()
+
+    db_markers = [
+        "/migrations/",
+        "/alembic/",
+        "migration",
+        "alembic",
+        "postgres",
+        "postgresql",
+        "database",
+        "db/schema",
+        ".sql",
+    ]
+
+    return any(marker in normalized for marker in db_markers)
+
+
 class WorkflowNodes:
     def __init__(self, orchestrator: OrchestratorService, po_agent: POAgent, po_review_agent: POReviewAgent, dev_agent: DevAgent, qc_agent: QCAgent):
         self.orchestrator = orchestrator
@@ -493,7 +514,99 @@ class WorkflowNodes:
                 dest_file.parent.mkdir(parents=True, exist_ok=True)
                 dest_file.write_text(content, encoding="utf-8")
         except Exception as e:
-            WorkflowLogger.error("workflow.write_project.error", workflow_id=workflow_id, error=str(e))
+            WorkflowLogger.exception("workflow.write_project.error", workflow_id=workflow_id, error=str(e))
+
+    def ensure_dependencies(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('ensure_dependencies', state)
+        self._check_cancelled(state['workflow_id'])
+        updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'ensure_dependencies']
+        current_task = updated['current_task']
+        task_display = f"t-{current_task['task_number']:03d}"
+        
+        # Validation for dev_output
+        dev_output = updated.get('dev_output') or {}
+        validation_failed = False
+        validation_error_msg = ""
+        for field in ['changed_files', 'created_files', 'modified_files', 'dependencies']:
+            if field in dev_output:
+                val = dev_output[field]
+                if not isinstance(val, list):
+                    validation_failed = True
+                    validation_error_msg = f"Field '{field}' must be a list, got {type(val).__name__}."
+                    WorkflowLogger.warning("workflow.nodes.validation_error", workflow_id=updated['workflow_id'], task_id=current_task['id'], field=field, value=val, type=type(val).__name__)
+                    break
+                if any(not isinstance(item, str) for item in val):
+                    validation_failed = True
+                    validation_error_msg = f"Field '{field}' must contain only strings."
+                    WorkflowLogger.warning("workflow.nodes.validation_error", workflow_id=updated['workflow_id'], task_id=current_task['id'], field=field, value=val, type="list_of_non_strings")
+                    break
+
+        if validation_failed:
+            updated['dependency_result'] = {
+                'passed': False,
+                'category': 'validation_error',
+                'phase': 'dependency',
+                'command': 'dev_output_validation',
+                'error_summary': validation_error_msg,
+                'stdout': '',
+                'stderr': validation_error_msg
+            }
+            updated['status'] = WorkflowStatus.DEPENDENCY_FAILED.value
+            self._log_node_exit('ensure_dependencies', updated)
+            return updated
+
+        # Check if we should skip the verification gate based on DB/migration files
+        is_only_db_migration = False
+        if 'files' in dev_output:
+            implemented_files = dev_output['files']
+            if implemented_files and all(
+                should_skip_db_or_migration_check(f.get('file_path', ''))
+                for f in implemented_files if isinstance(f, dict)
+            ):
+                is_only_db_migration = True
+
+        # Check if we should skip the verification gate based on task type
+        task_id_str = str(current_task.get('id', ''))
+        title = current_task.get('title', '').lower()
+        task_number = current_task.get('task_number', 0)
+        
+        if task_id_str.endswith('-001') or task_number == 1 or 'foundation' in title or 'codebase structure' in title or is_only_db_migration:
+            reason = 'Skipped verification gate: task only modifies DB/migration files' if is_only_db_migration else 'Skipped verification gate for foundation task'
+            WorkflowLogger.info("workflow.nodes.ensure_dependencies.skip", workflow_id=updated['workflow_id'], task_id=current_task['id'], reason=reason)
+            updated['dependency_result'] = {
+                'passed': True, 
+                'skipped': True, 
+                'skipped_gate': True,
+                'category': 'passed',
+                'error_summary': reason
+            }
+            updated['status'] = WorkflowStatus.DEV_DONE.value
+            self._log_node_exit('ensure_dependencies', updated)
+            return updated
+
+
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEPENDENCY_INSTALLING.value, AgentName.ORCHESTRATOR.value, f"Installing dependencies for task {task_display}.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEPENDENCY_INSTALLING.value, AgentName.ORCHESTRATOR.value, f"Ensuring dependencies for candidate project.")
+
+        # Write candidate project to disk
+        self._write_project_to_disk(updated['workflow_id'], updated.get('candidate_project', {}), "candidate")
+        
+        # Run dependency installation
+        candidate_dir = str(Path("generated_code") / f"wf_{updated['workflow_id']}" / "candidate")
+        project_context = extract_project_context_from_current_project(updated.get('candidate_project', {}))
+        
+        from app.agents.build_runner import ensure_dependencies as runner_ensure_deps
+        dep_result = runner_ensure_deps(candidate_dir, project_context)
+        
+        updated['dependency_result'] = dep_result
+        if dep_result['passed']:
+            updated['status'] = WorkflowStatus.DEV_DONE.value  # Ready for build
+        else:
+            updated['status'] = WorkflowStatus.DEPENDENCY_FAILED.value
+            
+        self._log_node_exit('ensure_dependencies', updated)
+        return updated
 
     def build_candidate(self, state: WorkflowState) -> WorkflowState:
         self._log_node_enter('build_candidate', state)
@@ -503,18 +616,30 @@ class WorkflowNodes:
         current_task = updated['current_task']
         task_display = f"t-{current_task['task_number']:03d}"
 
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.BUILD_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Building candidate for task {task_display}.", task_id=current_task['id'])
-        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.BUILD_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Running build/test for candidate project.")
+        dep_result = updated.get('dependency_result') or {}
+        if dep_result.get('skipped_gate'):
+            updated['build_result'] = {
+                'passed': True,
+                'skipped': True,
+                'skipped_gate': True,
+                'category': 'passed',
+                'error_summary': 'Skipped verification gate for foundation task'
+            }
+            updated['status'] = WorkflowStatus.DEV_DONE.value
+            self._log_node_exit('build_candidate', updated)
+            return updated
 
-        # Write candidate project to disk
-        self._write_project_to_disk(updated['workflow_id'], updated.get('candidate_project', {}), "candidate")
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.BUILD_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Building candidate for task {task_display}.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.BUILD_IN_PROGRESS.value, AgentName.ORCHESTRATOR.value, f"Running build for candidate project.")
+
+        # Project is already written to disk in ensure_dependencies
         
-        # Run build test
+        # Run build
         candidate_dir = str(Path("generated_code") / f"wf_{updated['workflow_id']}" / "candidate")
         project_context = extract_project_context_from_current_project(updated.get('candidate_project', {}))
         
-        from app.agents.build_runner import run_build_test
-        build_result = run_build_test(candidate_dir, project_context)
+        from app.agents.build_runner import run_build
+        build_result = run_build(candidate_dir, project_context)
         
         updated['build_result'] = build_result
         if build_result['passed']:
@@ -616,7 +741,17 @@ class WorkflowNodes:
         build_result = updated['build_result'] or {}
         task_display = f"t-{current_task['task_number']:03d}"
         
-        error_msg = f"Build/Test failed on command: `{build_result.get('command')}`\n\n**Error Summary**: {build_result.get('error_summary')}\n\n**Stdout**:\n```\n{build_result.get('stdout')}\n```\n\n**Stderr**:\n```\n{build_result.get('stderr')}\n```"
+        import json
+        bug_data = {
+            "type": "build_error",
+            "phase": build_result.get('phase', 'build'),
+            "failed_command": build_result.get('command', ''),
+            "category": build_result.get('category', 'build_failed'),
+            "error_summary": build_result.get('error_summary', ''),
+            "instruction_to_dev": "Fix the source code or build configuration causing this build failure."
+        }
+        
+        error_msg = f"Build failed on command: `{bug_data['failed_command']}`\n\n**Error Summary**: {bug_data['error_summary']}\n\n**JSON Data**:\n```json\n{json.dumps(bug_data, indent=2)}\n```\n\n**Stdout**:\n```\n{build_result.get('stdout')}\n```\n\n**Stderr**:\n```\n{build_result.get('stderr')}\n```"
 
         bug = self.orchestrator.ctx.task_repo.create_bug(
             workflow_id=updated['workflow_id'],
@@ -639,6 +774,50 @@ class WorkflowNodes:
         updated['status'] = WorkflowStatus.REOPENED_FOR_DEV.value
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
         self._log_node_exit('create_build_bug', updated)
+        return updated
+
+    def create_dependency_bug(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('create_dependency_bug', state)
+        self._check_cancelled(state['workflow_id'])
+        updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'create_dependency_bug']
+        current_task = updated['current_task']
+        dep_result = updated['dependency_result'] or {}
+        task_display = f"t-{current_task['task_number']:03d}"
+        
+        import json
+        bug_data = {
+            "type": "dependency_error",
+            "phase": dep_result.get('phase', 'dependency'),
+            "failed_command": dep_result.get('command', ''),
+            "category": dep_result.get('category', 'dependency_install_failed'),
+            "error_summary": dep_result.get('error_summary', ''),
+            "instruction_to_dev": "Check whether the missing package/tool should be added to requirements.txt, pyproject.toml, package.json, project_context install command, or other dependency manifest. Do not blindly patch around imports unless the dependency is unnecessary."
+        }
+        
+        error_msg = f"Dependency installation failed on command: `{bug_data['failed_command']}`\n\n**Error Summary**: {bug_data['error_summary']}\n\n**JSON Data**:\n```json\n{json.dumps(bug_data, indent=2)}\n```\n\n**Stdout**:\n```\n{dep_result.get('stdout')}\n```\n\n**Stderr**:\n```\n{dep_result.get('stderr')}\n```"
+
+        bug = self.orchestrator.ctx.task_repo.create_bug(
+            workflow_id=updated['workflow_id'],
+            task_id=current_task['id'],
+            title=f"Dependency Failure for task {task_display}",
+            description=error_msg,
+            severity="HIGH",
+            failed_criteria=[],
+        )
+        db_task = self.orchestrator.ctx.task_repo.get_task(current_task['id'])
+        assert db_task is not None
+        self.orchestrator.ctx.task_repo.increment_retry(db_task)
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.BUG_CREATED.value, AgentName.ORCHESTRATOR.value, f"Pipeline created dependency bug {bug.id} for task {task_display}.", task_id=current_task['id'])
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.REOPENED_FOR_DEV.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} reopened for DEV after dependency bug {bug.id}.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.REOPENED.value, AgentName.ORCHESTRATOR.value, f"Task {task_display} reopened for DEV to fix dependency failure.")
+        current_task = self.orchestrator.serialize_task(current_task['id'])
+        updated['current_task'] = current_task
+        updated['bug_reports'] = [*updated.get('bug_reports', []), {'id': bug.id, 'title': bug.title, 'description': bug.description, 'severity': bug.severity, 'failed_criteria': bug.failed_criteria, 'task_id': current_task['id']}]
+        updated['retry_count'] = current_task['retry_count']
+        updated['status'] = WorkflowStatus.REOPENED_FOR_DEV.value
+        updated['current_agent'] = AgentName.ORCHESTRATOR.value
+        self._log_node_exit('create_dependency_bug', updated)
         return updated
 
     def mark_task_done(self, state: WorkflowState) -> WorkflowState:
