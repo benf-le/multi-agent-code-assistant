@@ -211,3 +211,21 @@ def route_by_po_local_validate(state: WorkflowState) -> str:
     ]
 
     return route
+
+def route_by_final_qa_result(state: WorkflowState) -> str:
+    """Route after final project QA validation."""
+    status = state.get('final_project_qa_status')
+    
+    route = 'fail'
+    if status == 'success':
+        route = 'pass'
+    elif status == 'retry_required':
+        route = 'retry'
+        
+    # Update trace
+    state['route_decisions'] = [
+        *state.get('route_decisions', []),
+        {'node': 'final_qa_validate', 'route': route, 'reason': f"Final QA status: {status}"}
+    ]
+
+    return route

@@ -37,4 +37,12 @@ class WorkflowState(TypedDict, total=False):
     # Project state — in-memory project tracking
     current_project: dict[str, str]       # committed/accepted project state
     candidate_project: dict[str, str]     # temporary state after applying task, used for QC
+    
+    # Final Project QA State
+    final_project_qa_status: str | None
+    final_project_qa_attempts: int
+    final_project_qa_report: dict[str, Any] | None
+    final_project_fix_task: dict[str, Any] | None
+    final_project_build_logs: list[dict[str, Any]] | None
+    final_project_attempted_fixes: list[str] | None
 

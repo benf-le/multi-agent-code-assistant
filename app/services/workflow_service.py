@@ -3,7 +3,7 @@ from typing import Callable
 
 from sqlalchemy.orm import Session
 
-from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent
+from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent, FinalProjectQAAgent
 from app.core.config import get_settings
 from app.core.enums import AgentName, WorkflowStatus, TaskStatus
 from app.graph.nodes import WorkflowNodes
@@ -25,6 +25,7 @@ _TERMINAL_WORKFLOW_STATUSES = frozenset({
     WorkflowStatus.BLOCKED.value,
     WorkflowStatus.CANCELLED.value,
     WorkflowStatus.PO_REVIEW_FAILED.value,
+    WorkflowStatus.FINAL_QA_FAILED.value,
 })
 
 _RUNNABLE_TASK_STATUSES = frozenset({
@@ -71,16 +72,22 @@ class WorkflowService:
     def _build_agents(self):
         if not self.settings.openai_api_key:
             raise ValueError("OPENAI_API_KEY is not set in environment. Real agents are required.")
+        
+        kwargs = {
+            "api_key": self.settings.openai_api_key,
+        }
+        
         return (
-            POAgent(self.settings.openai_api_key),
-            POReviewAgent(self.settings.openai_api_key),
-            DevAgent(self.settings.openai_api_key),
-            QCAgent(self.settings.openai_api_key),
+            POAgent(**kwargs),
+            POReviewAgent(**kwargs),
+            DevAgent(**kwargs),
+            QCAgent(**kwargs),
+            FinalProjectQAAgent(**kwargs),
         )
 
     def _build_graph_factory(self, orchestrator: OrchestratorService) -> WorkflowGraphFactory:
-        po, po_review, dev, qc = self._build_agents()
-        nodes = WorkflowNodes(orchestrator, po, po_review, dev, qc)
+        po, po_review, dev, qc, final_qa = self._build_agents()
+        nodes = WorkflowNodes(orchestrator, po, po_review, dev, qc, final_qa)
         return WorkflowGraphFactory(nodes)
 
     def _graph_config(self) -> dict:
@@ -112,7 +119,16 @@ class WorkflowService:
         total = len(statuses)
 
         if done_count == total:
-            return WorkflowStatus.DONE.value
+            workflow = orchestrator.ctx.workflow_repo.get(workflow_id)
+            if workflow and workflow.status == WorkflowStatus.FINAL_QA_PASSED.value:
+                return WorkflowStatus.DONE.value
+            if workflow and workflow.status in (
+                WorkflowStatus.FINAL_QA_IN_PROGRESS.value,
+                WorkflowStatus.FINAL_QA_FAILED.value,
+                WorkflowStatus.FINAL_QA_RETRY_REQUIRED.value
+            ):
+                return workflow.status
+            return WorkflowStatus.TASKS_COMPLETED.value
         if done_count + blocked_count == total:
             return WorkflowStatus.BLOCKED.value
         return WorkflowStatus.BACKLOG_CREATED.value  # still has runnable tasks
@@ -125,7 +141,7 @@ class WorkflowService:
             final_status=final_status,
             message=f"Workflow finalized with status: {final_status}"
         )
-        if final_status in (WorkflowStatus.DONE.value, WorkflowStatus.BLOCKED.value):
+        if final_status in (WorkflowStatus.DONE.value, WorkflowStatus.BLOCKED.value, WorkflowStatus.FINAL_QA_FAILED.value):
             orchestrator.mark_workflow_finished(workflow_id, final_status, f'Workflow finished: {final_status}.')
         return final_status
 
@@ -330,6 +346,46 @@ class WorkflowService:
             }
 
     # ──────────────────────────────────────────────────────────────────────
+    #  Final QA Phase execution
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _run_final_qa_phase(self, session: Session, orchestrator: OrchestratorService, workflow, brd) -> dict:
+        """Run the Final QA phase as a single graph invocation."""
+        graph_factory = self._build_graph_factory(orchestrator)
+        final_qa_graph = graph_factory.build_final_qa_graph()
+        
+        state = {
+            'workflow_id': workflow.id,
+            'brd_id': brd.id,
+            'brd_content': brd.content,
+            'status': workflow.status,
+            'max_retry': workflow.max_retry,
+            'current_agent': AgentName.ORCHESTRATOR.value,
+            'current_project': {},
+            'final_project_qa_attempts': 0,
+        }
+        
+        workflow_id = workflow.id
+
+        try:
+            WorkflowLogger.info("workflow.graph.start", 
+                workflow_id=workflow_id, 
+                graph_name="final_qa_graph",
+                recursion_limit=self._graph_config().get("recursion_limit")
+            )
+            session.commit()
+            result = final_qa_graph.invoke(state, config=self._graph_config())
+            WorkflowLogger.info("workflow.graph.end", 
+                workflow_id=workflow_id, 
+                graph_name="final_qa_graph",
+                visited_nodes=result.get("visited_nodes", [])
+            )
+            return result
+        except Exception as e:
+            self._handle_graph_error(orchestrator, workflow_id, None, e, phase='final_qa_phase')
+            raise
+
+    # ──────────────────────────────────────────────────────────────────────
     #  Error handling
     # ──────────────────────────────────────────────────────────────────────
 
@@ -441,8 +497,22 @@ class WorkflowService:
                     else:
                         logger.info('Skipping PO phase — workflow %s already at status %s', workflow_id, workflow.status)
 
-                # ── Phase 2: Task execution loop ─────────────────────────
-                result = self._run_task_loop(session, orchestrator, workflow, brd)
+                # ── Phase 2 & 3: Task execution & Final QA loop ──────────
+                while True:
+                    result = self._run_task_loop(session, orchestrator, workflow, brd)
+                    
+                    if result.get('final_status') == WorkflowStatus.TASKS_COMPLETED.value:
+                        qa_result = self._run_final_qa_phase(session, orchestrator, workflow, brd)
+                        session.expire_all()
+                        workflow = orchestrator.ctx.workflow_repo.get(workflow_id)
+                        if workflow.status == WorkflowStatus.FINAL_QA_RETRY_REQUIRED.value:
+                            continue # Run task loop again for the new repair task
+                        else:
+                            result = qa_result
+                            result['final_status'] = self._finalize_workflow(orchestrator, workflow_id)
+                            break
+                    else:
+                        break
 
                 logger.info('Workflow execution %s finished with status=%s', workflow.id, result.get('final_status'))
                 return result
@@ -515,8 +585,23 @@ class WorkflowService:
                             'final_status': WorkflowStatus.PO_REVIEW_FAILED.value,
                         }
 
-                # Run task loop from current state
-                result = self._run_task_loop(session, orchestrator, workflow, brd)
+                # Run task loop & final QA loop from current state
+                while True:
+                    result = self._run_task_loop(session, orchestrator, workflow, brd)
+                    
+                    if result.get('final_status') == WorkflowStatus.TASKS_COMPLETED.value:
+                        qa_result = self._run_final_qa_phase(session, orchestrator, workflow, brd)
+                        session.expire_all()
+                        workflow = orchestrator.ctx.workflow_repo.get(workflow_id)
+                        if workflow.status == WorkflowStatus.FINAL_QA_RETRY_REQUIRED.value:
+                            continue # Run task loop again for the new repair task
+                        else:
+                            result = qa_result
+                            result['final_status'] = self._finalize_workflow(orchestrator, workflow_id)
+                            break
+                    else:
+                        break
+                        
                 logger.info('Resume of workflow %s finished with status=%s', workflow_id, result.get('final_status'))
                 return result
 

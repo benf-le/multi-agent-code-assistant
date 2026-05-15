@@ -805,3 +805,81 @@ class QCResult(StrictArtifactModel):
                 raise ValueError("If passed is false, status cannot be PASSED")
 
         return self
+
+
+# ============================================================
+# Final Project QA output schema
+# ============================================================
+
+class FinalProjectQAFixTask(StrictArtifactModel):
+    title: str = Field(
+        description="Short title for the repair task."
+    )
+    description: str = Field(
+        description="Detailed explanation of what needs to be fixed based on the final project validation failures."
+    )
+    assignee_team: Team = Field(
+        description="The team responsible for fixing this. Usually backend, frontend, or devops."
+    )
+    acceptance_criteria: list[str] = Field(
+        default_factory=list,
+        description="Specific testable criteria to verify the fix."
+    )
+    required_markers: list[str] = Field(
+        default_factory=list,
+        description="Specific snake_case markers to verify the fix."
+    )
+    input_context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Context for the DevAgent including failed commands, logs, files to edit, etc."
+    )
+
+    @field_validator("title", "description")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        return _clean_text(value)
+
+    @field_validator("acceptance_criteria")
+    @classmethod
+    def validate_acceptance_criteria(cls, values: list[str]) -> list[str]:
+        return _clean_string_list(values)
+
+    @field_validator("required_markers")
+    @classmethod
+    def validate_required_markers(cls, values: list[str]) -> list[str]:
+        values = _clean_string_list(values, "required_markers")
+        invalid = [value for value in values if not _MARKER_PATTERN.match(value)]
+        if invalid:
+            raise ValueError(
+                f"invalid required_markers: {invalid}. "
+                "Markers must be snake_case identifiers with no spaces."
+            )
+        generic = [v for v in values if v in GENERIC_MARKERS_BLACKLIST]
+        if generic:
+            raise ValueError(f"Banned generic markers found: {generic}")
+        return values
+
+
+class FinalProjectQAResult(StrictArtifactModel):
+    passed: bool = Field(
+        description="True only if all commands ran successfully and the project validates as a complete runnable application."
+    )
+    status: str = Field(
+        description="Status description (e.g., 'PASSED', 'FAILED')."
+    )
+    validation_report: str = Field(
+        default="",
+        description="Detailed validation report of the project."
+    )
+    repair_task: FinalProjectQAFixTask | None = Field(
+        default=None,
+        description="A consolidated repair task for DevAgent if validation fails."
+    )
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> "FinalProjectQAResult":
+        if self.passed and self.repair_task is not None:
+            raise ValueError("If passed is true, repair_task must be null.")
+        if not self.passed and self.repair_task is None:
+            raise ValueError("If passed is false, repair_task must be provided.")
+        return self

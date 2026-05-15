@@ -1,7 +1,7 @@
 import json
 from typing import Any
 from langchain_openai import ChatOpenAI
-from app.agents.base import POResult, POReviewResult, DevResult, QCResult, GENERIC_MARKERS_BLACKLIST
+from app.agents.base import POResult, POReviewResult, DevResult, QCResult, FinalProjectQAResult, GENERIC_MARKERS_BLACKLIST
 from app.agents.serialization_utils import to_plain_dict, to_pretty_json  # noqa: F401 — re-exported
 from pydantic import ValidationError
 
@@ -475,8 +475,8 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
 class OpenAIAPIAgent:
     """Base class for OpenAI-powered agents."""
 
-    def __init__(self, api_key: str, model: str = "gpt-5-mini"):
-        self.llm = ChatOpenAI(model=model, api_key=api_key, temperature=0)
+    def __init__(self, api_key: str):
+        self.llm = ChatOpenAI(model="gpt-4o-mini", api_key=api_key, temperature=0)
 
 
 # ============================================================
@@ -680,6 +680,69 @@ Instructions:
         ]
 
         return invoke_structured_with_retry(structured_llm, messages)
+
+
+# ============================================================
+# Final Project QA Agent
+# ============================================================
+
+FINAL_PROJECT_QA_SYSTEM_PROMPT = """
+You are a senior Software QA Architect and Integration Specialist.
+Your job is to validate an entire generated project as a complete, runnable application.
+
+You are NOT validating a single task. You are validating the final project state after all development tasks are done.
+You will be given:
+1. The project context (structure, stack, dependencies, entrypoints).
+2. The exact commands that were executed to validate the project.
+3. The standard output and standard error from those commands.
+
+Your responsibilities:
+1. Analyze the logs to determine if the project successfully installed dependencies, built, tested, and started.
+2. Detect integration issues (e.g., missing imports, bad paths, missing dependencies, frontend calling non-existent backend routes).
+3. If the project passed all critical commands with no errors, return passed=true.
+4. If the project failed, return passed=false and formulate a single, actionable repair task for the DevAgent.
+5. The repair task must include a clear explanation, the failing commands, and concrete input_context to help DevAgent fix the codebase.
+6. Do NOT assume the project works if there are obvious compilation or startup errors.
+7. Treat warnings as passing, but treat fatal errors, panics, exceptions, or module-not-found errors as failing.
+
+Your output must strictly match the FinalProjectQAResult schema.
+"""
+
+class FinalProjectQAAgent(OpenAIAPIAgent):
+    """Agent responsible for final whole-project validation and repair task generation."""
+
+    def analyze_results(
+        self,
+        project_context: dict[str, Any],
+        build_logs: list[dict[str, Any]]
+    ) -> FinalProjectQAResult:
+        structured_llm = self.llm.with_structured_output(
+            FinalProjectQAResult,
+            method="function_calling",
+        )
+
+        human_prompt = f"""
+Validate the entire project state and the execution logs.
+
+Project Context:
+{to_pretty_json(project_context)}
+
+Execution Logs (commands run):
+{to_pretty_json(build_logs)}
+
+Instructions:
+- If all commands succeeded (exit code 0 or no critical runtime errors), set `passed: true` and `repair_task: null`.
+- If any command failed (dependency, build, test, run), set `passed: false` and provide a `repair_task`.
+- The `repair_task` must be concrete. Specify exactly what file/dependency is broken based on the logs.
+- Provide a clear `validation_report`.
+"""
+        messages = [
+            ("system", FINAL_PROJECT_QA_SYSTEM_PROMPT.strip()),
+            ("human", human_prompt.strip()),
+        ]
+
+        return invoke_structured_with_retry(structured_llm, messages)
+
 
 
 # ============================================================

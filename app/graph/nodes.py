@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from app.agents.base import DevResult, POResult
-from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent, to_plain_dict, validate_po_result_locally, filter_active_po_issues
+from app.agents.openai_agents import POAgent, POReviewAgent, DevAgent, QCAgent, FinalProjectQAAgent, to_plain_dict, validate_po_result_locally, filter_active_po_issues
 from app.agents.project_utils import (
     apply_dev_result_to_project,
     assert_required_foundation_files,
@@ -38,12 +38,13 @@ def should_skip_db_or_migration_check(value: object) -> bool:
 
 
 class WorkflowNodes:
-    def __init__(self, orchestrator: OrchestratorService, po_agent: POAgent, po_review_agent: POReviewAgent, dev_agent: DevAgent, qc_agent: QCAgent):
+    def __init__(self, orchestrator: OrchestratorService, po_agent: POAgent, po_review_agent: POReviewAgent, dev_agent: DevAgent, qc_agent: QCAgent, final_qa_agent: FinalProjectQAAgent):
         self.orchestrator = orchestrator
         self.po_agent = po_agent
         self.po_review_agent = po_review_agent
         self.dev_agent = dev_agent
         self.qc_agent = qc_agent
+        self.final_qa_agent = final_qa_agent
 
     def _check_cancelled(self, workflow_id: int):
         if self.orchestrator.check_cancellation(workflow_id):
@@ -903,3 +904,139 @@ class WorkflowNodes:
         updated['current_agent'] = AgentName.ORCHESTRATOR.value
         self._log_node_exit('max_retry_exceeded', updated)
         return updated
+
+    # ──────────────────────────────────────────────────────────────────────
+    #  Final Project QA Nodes
+    # ──────────────────────────────────────────────────────────────────────
+
+    def final_qa_validate(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('final_qa_validate', state)
+        self._check_cancelled(state['workflow_id'])
+        updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'final_qa_validate']
+        
+        self.orchestrator.update_workflow_status(
+            updated['workflow_id'], WorkflowStatus.FINAL_QA_IN_PROGRESS.value, 
+            AgentName.ORCHESTRATOR.value, "Starting final project validation phase."
+        )
+
+        current_project = updated.get('current_project', {})
+        project_context = extract_project_context_from_current_project(current_project) or self._read_project_context(updated['workflow_id'])
+        
+        # Write out current project to standard directory for running commands
+        dest_dir = "final_qa_candidate"
+        self._write_project_to_disk(updated['workflow_id'], current_project, dest_dir)
+        candidate_dir = str(Path("generated_code") / f"wf_{updated['workflow_id']}" / dest_dir)
+        
+        build_logs = []
+        from app.agents.build_runner import ensure_dependencies, run_build
+        
+        # 1. Install dependencies
+        dep_res = ensure_dependencies(candidate_dir, project_context)
+        build_logs.append(dep_res)
+        
+        # 2. Build if dependencies passed
+        if dep_res.get('passed', False):
+            build_res = run_build(candidate_dir, project_context)
+            build_logs.append(build_res)
+            
+        updated['final_project_build_logs'] = build_logs
+
+        self.orchestrator.update_workflow_status(
+            updated['workflow_id'], WorkflowStatus.FINAL_QA_IN_PROGRESS.value, 
+            AgentName.FINAL_PROJECT_QA.value, "Analyzing project logs for final QA."
+        )
+        
+        self.orchestrator.ctx.session.commit() # End transaction before LLM
+        qa_result = self.final_qa_agent.analyze_results(
+            project_context=project_context,
+            build_logs=build_logs
+        )
+        
+        updated['final_project_qa_report'] = qa_result.model_dump()
+        
+        self.orchestrator.record_agent_run(
+            updated['workflow_id'], AgentName.FINAL_PROJECT_QA.value, 'SUCCESS',
+            input_payload={'build_logs': build_logs}, output_payload=updated['final_project_qa_report']
+        )
+
+        if qa_result.passed:
+            updated['final_project_qa_status'] = 'success'
+            self.orchestrator.update_workflow_status(
+                updated['workflow_id'], WorkflowStatus.FINAL_QA_PASSED.value, 
+                AgentName.FINAL_PROJECT_QA.value, "Final Project QA passed."
+            )
+        else:
+            attempts = updated.get('final_project_qa_attempts', 0) + 1
+            updated['final_project_qa_attempts'] = attempts
+            
+            # The agent outputs a repair_task if it fails
+            repair_task_dict = None
+            if qa_result.repair_task:
+                repair_task_dict = qa_result.repair_task.model_dump()
+                
+            if attempts <= state.get('max_retry', 3):
+                updated['final_project_qa_status'] = 'retry_required'
+                updated['final_project_fix_task'] = repair_task_dict
+                self.orchestrator.update_workflow_status(
+                    updated['workflow_id'], WorkflowStatus.FINAL_QA_RETRY_REQUIRED.value, 
+                    AgentName.FINAL_PROJECT_QA.value, f"Final QA failed. Generated repair task. Attempt {attempts}."
+                )
+            else:
+                updated['final_project_qa_status'] = 'failed'
+                self.orchestrator.update_workflow_status(
+                    updated['workflow_id'], WorkflowStatus.FINAL_QA_FAILED.value, 
+                    AgentName.FINAL_PROJECT_QA.value, f"Final QA failed after {attempts} attempts."
+                )
+                
+        self._log_node_exit('final_qa_validate', updated)
+        return updated
+
+    def create_final_qa_fix_task(self, state: WorkflowState) -> WorkflowState:
+        self._log_node_enter('create_final_qa_fix_task', state)
+        self._check_cancelled(state['workflow_id'])
+        updated = deepcopy(state)
+        updated['visited_nodes'] = [*updated.get('visited_nodes', []), 'create_final_qa_fix_task']
+        
+        fix_task_data = updated.get('final_project_fix_task')
+        if not fix_task_data:
+            raise ValueError("No final_project_fix_task data found.")
+            
+        task_title = fix_task_data.get('title', 'Final QA Project Fix')
+        task_desc = fix_task_data.get('description', 'Fix issues found during Final QA phase.')
+        assignee_team = fix_task_data.get('assignee_team', 'backend')
+        req_markers = fix_task_data.get('required_markers', [])
+        input_ctx = fix_task_data.get('input_context', {})
+        
+        # Attach the build logs into input context for DevAgent
+        input_ctx['final_qa_build_logs'] = updated.get('final_project_build_logs', [])
+        
+        # We need a backlog item to attach the task to. Let's find the first backlog item.
+        backlog_items = self.orchestrator.ctx.task_repo.list_backlog_items(updated['workflow_id'])
+        backlog_item_id = backlog_items[0].id if backlog_items else None
+        
+        db_task = self.orchestrator.ctx.task_repo.create_task(
+            workflow_id=updated['workflow_id'],
+            backlog_item_id=backlog_item_id,
+            title=task_title,
+            description=task_desc,
+            assignee_team=assignee_team,
+            max_retry=state.get('max_retry', 3),
+            required_markers=req_markers,
+            input_context=input_ctx
+        )
+        
+        for ac in fix_task_data.get('acceptance_criteria', []):
+            self.orchestrator.ctx.task_repo.attach_acceptance_criterion(updated['workflow_id'], db_task.id, ac)
+            
+        self.orchestrator.update_workflow_status(
+            updated['workflow_id'], WorkflowStatus.REOPENED_FOR_DEV.value, 
+            AgentName.ORCHESTRATOR.value, f"Created Final QA fix task t-{db_task.task_number:03d}.", task_id=db_task.id
+        )
+        
+        # We don't dispatch it directly here; we let the service loop pick it up natively.
+        # But we need to ensure the graph gracefully ends so the service loop resumes.
+        
+        self._log_node_exit('create_final_qa_fix_task', updated)
+        return updated
+
