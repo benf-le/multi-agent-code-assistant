@@ -73,7 +73,7 @@ POReviewResult rules:
 
 DevResult rules:
 - task_id must use TASK-001 format.
-- setup_commands must be a list of strings (shell commands, prefer bun over npx) to scaffold or initialize the project.
+- setup_commands must be a list of strings (shell commands) to scaffold or initialize the project. Do NOT use npx or npm create; you MUST use bun for JS/TS.
 - files must be a list of objects only.
 - Every files item must be an object with exactly file_path and code.
 - Never put strings such as "unit_tests", "NULL", "null", "None", "tests", or placeholders inside files.
@@ -1021,6 +1021,7 @@ Schema compliance rules:
 - setup_commands is an optional list of shell commands to scaffold or initialize the project.
   - Use this for foundation tasks (e.g. `bun create vite web --template react-ts`, `go mod init`, `django-admin startproject`).
   - These commands will be executed in the project root BEFORE your files are applied.
+  - Do NOT use `npx` or `npm create`. You MUST use `bun` for JavaScript/TypeScript scaffolding.
   - Do NOT include `npm install`, `bun install`, or `pip install` here; dependencies are installed automatically by the pipeline.
   - ONLY use this for project scaffolding/initialization commands.
   - Do NOT use `mkdir`, `touch`, or manual file/folder creation commands. The system automatically creates necessary directories when you output `files`.
