@@ -212,10 +212,6 @@ class BacklogItemOut(StrictArtifactModel):
         default_factory=list,
         description="Assumptions relevant to this backlog item."
     )
-    acceptance_criteria: list[str] = Field(
-        default_factory=list,
-        description="Optional high-level acceptance criteria for this backlog item."
-    )
     source_references: list[str] = Field(
         default_factory=list,
         description="Optional references to BRD sections supporting this backlog item."
@@ -243,7 +239,7 @@ class BacklogItemOut(StrictArtifactModel):
             raise ValueError(f"invalid related_user_story_ids: {invalid}")
         return values
 
-    @field_validator("assumptions", "acceptance_criteria", "source_references")
+    @field_validator("assumptions", "source_references")
     @classmethod
     def validate_string_lists(cls, values: list[str]) -> list[str]:
         return _clean_string_list(values)
@@ -308,7 +304,7 @@ class TaskOut(StrictArtifactModel):
             if not str(k).strip():
                 raise ValueError("input_context contains empty key")
             # Only block if value is truly null/empty-string, OR if it's empty list/dict AND not in allowed set
-            if v in (None, "") or (not v and k not in keys_allowing_empty):
+            if v in (None, "") or (isinstance(v, (list, dict, set)) and not v and k not in keys_allowing_empty):
                 raise ValueError(f"input_context key '{k}' has invalid empty value: {v}")
 
         return value
@@ -388,6 +384,19 @@ class POResult(StrictArtifactModel):
         if value is None:
             return ""
         return value.strip()
+
+    @field_validator("resolution_map", mode="before")
+    @classmethod
+    def normalize_resolution_map(cls, value: Any) -> dict[str, str]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            # If the LLM generates a list of strings for a key, join them
+            return {
+                str(k): "; ".join(v) if isinstance(v, list) else str(v)
+                for k, v in value.items()
+            }
+        return value
 
     @model_validator(mode="after")
     def validate_cross_references(self) -> "POResult":
@@ -592,6 +601,10 @@ class TestFile(StrictArtifactModel):
 class DevResult(StrictArtifactModel):
     task_id: str = Field(
         description="Task id this implementation satisfies, e.g. TASK-001."
+    )
+    setup_commands: list[str] = Field(
+        default_factory=list,
+        description="Optional shell commands to scaffold or initialize the project (e.g., 'npm create vite@latest . --template react-ts'). Run before files are applied."
     )
     files: list[ImplementedFile] = Field(
         default_factory=list,

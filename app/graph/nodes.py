@@ -469,9 +469,13 @@ class WorkflowNodes:
         self._check_cancelled(updated['workflow_id'])
         bug_reports = self.orchestrator.ctx.task_repo.list_bugs_for_task(current_task['id'])
 
-        # Build project context from current_project (in-memory state)
-        current_project = updated.get('current_project', {})
-        project_context = extract_project_context_from_current_project(current_project) or self._read_project_context(updated['workflow_id'])
+        # Use candidate_project if it exists (meaning we are retrying after a bug),
+        # otherwise use current_project (meaning this is the first attempt for this task).
+        snapshot_for_dev = updated.get('candidate_project')
+        if not snapshot_for_dev:
+            snapshot_for_dev = updated.get('current_project', {})
+
+        project_context = extract_project_context_from_current_project(snapshot_for_dev) or self._read_project_context(updated['workflow_id'])
 
         self.orchestrator.ctx.session.commit() # End transaction before long LLM call
         dev_result = self.dev_agent.implement(
@@ -479,7 +483,7 @@ class WorkflowNodes:
             acceptance_criteria=current_task['acceptance_criteria'],
             bug_reports=[{'id': b.id, 'title': b.title, 'description': b.description, 'failed_criteria': b.failed_criteria} for b in bug_reports],
             project_context=project_context,
-            current_project_snapshot=current_project,
+            current_project_snapshot=snapshot_for_dev,
         )
         output_payload = dev_result.model_dump()
         db_task = self.orchestrator.ctx.task_repo.get_task(current_task['id'])
@@ -493,9 +497,50 @@ class WorkflowNodes:
         
         # Dev output is generated in memory. Physical files are saved in build_candidate and mark_task_done.
 
-        # Build candidate_project by applying DevResult to current_project.
+        setup_commands = getattr(dev_result, 'setup_commands', [])
+        if setup_commands:
+            import os
+            import shutil
+            from pathlib import Path
+            from app.agents.build_runner import run_command
+            
+            scratch_dir = Path("generated_code") / f"wf_{updated['workflow_id']}" / "scratch_setup"
+            if scratch_dir.exists():
+                shutil.rmtree(scratch_dir, ignore_errors=True)
+            scratch_dir.mkdir(parents=True, exist_ok=True)
+            
+            for raw_path, content in snapshot_for_dev.items():
+                clean_path = raw_path.lstrip("/\\").replace("..", "")
+                dest_file = scratch_dir / clean_path
+                dest_file.parent.mkdir(parents=True, exist_ok=True)
+                dest_file.write_text(content, encoding="utf-8")
+                
+            for cmd in setup_commands:
+                WorkflowLogger.info("workflow.nodes.dev_implement.setup_command", workflow_id=updated['workflow_id'], command=cmd)
+                res = run_command(cmd, scratch_dir, timeout=300, phase="setup")
+                if not res["passed"]:
+                    WorkflowLogger.warning("workflow.nodes.dev_implement.setup_command_failed", workflow_id=updated['workflow_id'], command=cmd, error=res["stderr"])
+            
+            snapshot_for_dev = {}
+            for root, _, files in os.walk(scratch_dir):
+                for f in files:
+                    file_path = Path(root) / f
+                    rel_path = file_path.relative_to(scratch_dir).as_posix()
+                    if any(part in ['.git', 'node_modules', '__pycache__', '.venv', 'dist', 'build', '.pytest_cache'] for part in Path(rel_path).parts):
+                        continue
+                    try:
+                        snapshot_for_dev[rel_path] = file_path.read_text(encoding="utf-8")
+                    except Exception:
+                        pass
+                        
+            try:
+                shutil.rmtree(scratch_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        # Build candidate_project by applying DevResult to the snapshot used.
         # Do NOT commit to current_project yet — QC must validate first.
-        candidate_project = apply_dev_result_to_project(current_project, dev_result)
+        candidate_project = apply_dev_result_to_project(snapshot_for_dev, dev_result)
         updated['candidate_project'] = candidate_project
 
         updated['current_task'] = current_task
@@ -526,7 +571,11 @@ class WorkflowNodes:
         task_display = f"t-{current_task['task_number']:03d}"
         
         # Validation for dev_output
-        dev_output = updated.get('dev_output') or {}
+        raw_dev_output = updated.get('dev_output')
+        if isinstance(raw_dev_output, list):
+            dev_output = {'files': raw_dev_output}
+        else:
+            dev_output = raw_dev_output or {}
         validation_failed = False
         validation_error_msg = ""
         for field in ['changed_files', 'created_files', 'modified_files', 'dependencies']:

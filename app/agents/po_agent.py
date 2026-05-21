@@ -14,10 +14,13 @@ class MockPOAgent:
         implementation_tasks: list[TaskOut] = []
 
         for idx, chunk in enumerate(story_chunks, start=1):
+            story_id = f"US-{idx:03d}"
+            backlog_item_id = f"BL-{idx:03d}"
             criteria = [f'System satisfies: {item}' for item in chunk]
             story_description = 'As a business user, I want ' + '; '.join(chunk)
             stories.append(
                 StoryOut(
+                    story_id=story_id,
                     title=f'User story {idx}',
                     description=story_description,
                     acceptance_criteria=criteria,
@@ -25,15 +28,30 @@ class MockPOAgent:
                 )
             )
             team = 'backend' if idx % 2 == 1 else 'frontend'
-            backlog_items.append({'title': f'Backlog item {idx}', 'description': story_description, 'team': team})
+            backlog_items.append(
+                {
+                    'backlog_item_id': backlog_item_id,
+                    'title': f'Backlog item {idx}',
+                    'description': story_description,
+                    'team': team,
+                    'related_user_story_ids': [story_id],
+                }
+            )
             implementation_tasks.append(
                 TaskOut(
+                    task_id=f"TASK-{idx:03d}",
                     title=f'{team.title()} implementation task {idx}',
                     description='Implement: ' + '; '.join(chunk),
                     assignee_team=team,
+                    related_user_story_ids=[story_id],
+                    related_backlog_item_ids=[backlog_item_id],
                     acceptance_criteria=criteria,
                     required_markers=[normalize_marker(item) for item in chunk],
-                    input_context={'requirements': chunk, 'expected_failures': 1 if idx == 1 else 0},
+                    input_context={
+                        'requirements': chunk,
+                        'expected_failures': 1 if idx == 1 else 0,
+                        'source': 'mock_po_agent',
+                    },
                 )
             )
 

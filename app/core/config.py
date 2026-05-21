@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     default_max_retry: int = Field(default=2, alias='DEFAULT_MAX_RETRY')
     poll_interval_ms: int = Field(default=3000, alias='POLL_INTERVAL_MS')
     openai_api_key: str = Field(default='', alias='OPENAI_API_KEY')
+    openai_base_url: str = Field(default='https://api.openai.com/v1', alias='OPENAI_BASE_URL')
+    openai_model: str = Field(default='gpt-4o', alias='OPENAI_MODEL')
     # Safety guard for LangGraph recursion. With 1-task-per-run design,
     # worst case is ~5 steps per retry cycle.  max_retry=3 → 20 steps max.
     # 50 is generous but safe.

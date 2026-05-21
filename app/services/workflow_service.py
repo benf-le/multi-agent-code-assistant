@@ -1,4 +1,5 @@
 import logging
+from pathlib import Path
 from typing import Callable
 
 from sqlalchemy.orm import Session
@@ -75,6 +76,8 @@ class WorkflowService:
         
         kwargs = {
             "api_key": self.settings.openai_api_key,
+            "base_url": self.settings.openai_base_url,
+            "model": self.settings.openai_model,
         }
         
         return (
@@ -219,6 +222,7 @@ class WorkflowService:
     def _build_task_state(self, orchestrator: OrchestratorService, workflow, brd, task_dict: dict) -> WorkflowState:
         """Build state for a single-task execution graph, reconstructed from DB."""
         bug_reports = orchestrator.ctx.task_repo.list_bugs_for_task(task_dict['id'])
+        current_project = self._load_project_from_disk(workflow.id)
         return {
             'workflow_id': workflow.id,
             'brd_id': brd.id,
@@ -248,9 +252,37 @@ class WorkflowService:
             'loop_signatures': [],
             'visited_nodes': [],
             'route_decisions': [],
-            'current_project': {},
+            'current_project': current_project,
             'candidate_project': {},
         }
+
+    def _load_project_from_disk(self, workflow_id: int) -> dict[str, str]:
+        """Load the accepted generated project so later task graph runs keep context."""
+        project_dir = Path("generated_code") / f"wf_{workflow_id}" / "project"
+        if not project_dir.exists():
+            return {}
+
+        project: dict[str, str] = {}
+        for path in project_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            rel_path = path.relative_to(project_dir).as_posix()
+            try:
+                project[rel_path] = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                WorkflowLogger.warning(
+                    "workflow.project_state.skip_binary_file",
+                    workflow_id=workflow_id,
+                    file_path=rel_path,
+                )
+            except Exception as exc:
+                WorkflowLogger.warning(
+                    "workflow.project_state.read_file_failed",
+                    workflow_id=workflow_id,
+                    file_path=rel_path,
+                    error=str(exc),
+                )
+        return project
 
     # ──────────────────────────────────────────────────────────────────────
     #  PO Phase execution

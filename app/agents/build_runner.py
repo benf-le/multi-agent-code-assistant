@@ -19,7 +19,13 @@ def _parse_project_context(project_context_str: str | None) -> dict:
         if json_str.endswith("```"):
             json_str = json_str[:-3]
             
-        return json.loads(json_str)
+        parsed = json.loads(json_str)
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, dict):
+                    return item
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
 
@@ -48,9 +54,11 @@ def _detect_install_cmd(candidate_path: Path, ctx: dict) -> str | None:
         return install_cmd
         
     if (candidate_path / "package.json").exists():
+        if (candidate_path / "bun.lockb").exists() or (candidate_path / "bun.lock").exists():
+            return "bun install"
         if (candidate_path / "package-lock.json").exists():
             return "npm ci"
-        return "npm install"
+        return "bun install"
     if (candidate_path / "requirements.txt").exists():
         return "pip install -r requirements.txt"
     if (candidate_path / "pyproject.toml").exists():
@@ -73,7 +81,7 @@ def _detect_build_cmd(candidate_path: Path, ctx: dict) -> str | None:
             with open(candidate_path / "package.json", "r", encoding="utf-8") as f:
                 pkg = json.load(f)
                 if "scripts" in pkg and "build" in pkg["scripts"]:
-                    return "npm run build"
+                    return "bun run build"
         except Exception:
             pass
             
