@@ -1,7 +1,8 @@
 import json
+import time
 from typing import Any
 from langchain_openai import ChatOpenAI
-from app.agents.base import POResult, POReviewResult, DevResult, QCResult, GENERIC_MARKERS_BLACKLIST
+from app.agents.base import POResult, POReviewResult, DevResult, QCResult, FinalProjectQAResult, GENERIC_MARKERS_BLACKLIST
 from app.agents.serialization_utils import to_plain_dict, to_pretty_json  # noqa: F401 — re-exported
 from pydantic import ValidationError
 
@@ -20,6 +21,8 @@ def invoke_structured_with_retry(structured_llm, messages, max_attempts: int = 2
 
     for _ in range(max_attempts):
         try:
+            # Throttle API calls to avoid 429 Rate Limit
+            time.sleep(2.0)
             return structured_llm.invoke(messages)
         except Exception as exc:
             last_error = exc
@@ -70,6 +73,7 @@ POReviewResult rules:
 
 DevResult rules:
 - task_id must use TASK-001 format.
+- setup_commands must be a list of strings (shell commands) to scaffold or initialize the project. Do NOT use npx or npm create; you MUST use bun for JS/TS. For Go, use `go mod init <module_name>`.
 - files must be a list of objects only.
 - Every files item must be an object with exactly file_path and code.
 - Never put strings such as "unit_tests", "NULL", "null", "None", "tests", or placeholders inside files.
@@ -231,96 +235,7 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
     """
     issues: list[dict] = []
 
-    vague_phrases = [
-        "properly",
-        "correctly",
-        "gracefully",
-        "seamlessly",
-        "user-friendly",
-        "fast",
-        "performant",
-        "scalable",
-        "secure",
-        "robust",
-        "maintainable",
-        "extensible",
-        "clean",
-        "future extension",
-        "allow future extension",
-        "structured error responses",
-        "consistent with design",
-        "normal response time",
-        "as needed",
-        "where applicable",
-        "works well",
-        "appropriate",
-        "relevant",
-        "optimized",
-    ]
-
-    # 1. Acceptance Criteria quality for user stories
-    for story in po.user_stories:
-        for idx, ac in enumerate(story.acceptance_criteria or [], 1):
-            ac_text = ac or ""
-            found = [p for p in vague_phrases if p in ac_text.lower()]
-
-            if found and not has_observable_detail(ac_text):
-                issues.append({
-                    "category": "acceptance_criteria",
-                    "severity": "HIGH",
-                    "description": (
-                        f"Story {story.story_id} AC-{idx} contains vague phrase(s) {found} "
-                        "without concrete observable verification details."
-                    ),
-                    "affected_items": [f"{story.story_id}.acceptance_criteria[{idx}]"],
-                    "suggestion": (
-                        "Rewrite the AC with condition/input, observable behavior, and expected output/state/status."
-                    ),
-                })
-            elif found:
-                issues.append({
-                    "category": "acceptance_criteria",
-                    "severity": "LOW",
-                    "description": (
-                        f"Story {story.story_id} AC-{idx} contains vague phrase(s) {found}, "
-                        "but also appears to include observable details."
-                    ),
-                    "affected_items": [f"{story.story_id}.acceptance_criteria[{idx}]"],
-                    "suggestion": "Consider removing vague wording if it is not needed.",
-                })
-
-    # 2. Acceptance Criteria quality for tasks
-    for task in po.implementation_tasks:
-        for idx, ac in enumerate(task.acceptance_criteria or [], 1):
-            ac_text = ac or ""
-            found = [p for p in vague_phrases if p in ac_text.lower()]
-
-            if found and not has_observable_detail(ac_text):
-                issues.append({
-                    "category": "acceptance_criteria",
-                    "severity": "HIGH",
-                    "description": (
-                        f"Task {task.task_id} AC-{idx} contains vague phrase(s) {found} "
-                        "without concrete observable verification details."
-                    ),
-                    "affected_items": [f"{task.task_id}.acceptance_criteria[{idx}]"],
-                    "suggestion": (
-                        "Rewrite the AC so DEV/QC can verify it with a clear pass/fail signal."
-                    ),
-                })
-            elif found:
-                issues.append({
-                    "category": "acceptance_criteria",
-                    "severity": "LOW",
-                    "description": (
-                        f"Task {task.task_id} AC-{idx} contains vague phrase(s) {found}, "
-                        "but also appears to include observable details."
-                    ),
-                    "affected_items": [f"{task.task_id}.acceptance_criteria[{idx}]"],
-                    "suggestion": "Consider removing vague wording if it is not needed.",
-                })
-
-    # 3. Backlog traceability
+    # 1. Backlog traceability
     story_ids = {s.story_id for s in po.user_stories}
 
     for item in po.backlog_items:
@@ -348,7 +263,7 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
                 "suggestion": "Use only existing story IDs in related_user_story_ids.",
             })
 
-    # 4. Task traceability and task quality
+    # 2. Task traceability and task quality
     backlog_ids = {b.backlog_item_id for b in po.backlog_items}
 
     for task in po.implementation_tasks:
@@ -428,7 +343,11 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
                 ),
             })
 
-        if not task.acceptance_criteria:
+        # F-007: Product clarification tasks produce decision documents, not code.
+        # They cannot have implementable markers — exempt them from mandatory checks.
+        is_product_task = str(getattr(task, "assignee_team", "")).lower() == "product"
+
+        if not task.acceptance_criteria and not is_product_task:
             issues.append({
                 "category": "acceptance_criteria",
                 "severity": "HIGH",
@@ -437,7 +356,7 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
                 "suggestion": "Define at least one pass/fail observable acceptance criterion.",
             })
 
-        if not task.required_markers:
+        if not task.required_markers and not is_product_task:
             issues.append({
                 "category": "marker_quality",
                 "severity": "HIGH",
@@ -445,7 +364,7 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
                 "affected_items": [f"{task.task_id}.required_markers"],
                 "suggestion": "Add concrete snake_case markers that DEV/QC can verify.",
             })
-        else:
+        elif task.required_markers:
             bad_markers = [
                 m for m in task.required_markers
                 if m in GENERIC_MARKERS_BLACKLIST
@@ -475,8 +394,13 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
 class OpenAIAPIAgent:
     """Base class for OpenAI-powered agents."""
 
-    def __init__(self, api_key: str, model: str = "gpt-5-mini"):
-        self.llm = ChatOpenAI(model=model, api_key=api_key, temperature=0)
+    def __init__(self, api_key: str, base_url: str = None, model: str = "gpt-5-nano"):
+        self.llm = ChatOpenAI(
+            model=model,
+            api_key=api_key,
+            base_url=base_url,
+            temperature=0
+        )
 
 
 # ============================================================
@@ -504,6 +428,7 @@ Priority 1 — Must obey:
 8. Every implementation task must reference at least one existing user story and one existing backlog item.
 9. Do not collapse all work into backend unless the BRD truly only describes backend/internal service work.
 10. MANDATORY FIRST TASK: The very first task (TASK-001) MUST be 'Project Foundation: Codebase Structure, README, and Project Context'.
+    - This task MUST be mapped to ALL user_story_ids and backlog_item_ids because every feature depends on the project foundation.
     - This task's goal is to establish the project's file structure and create the project contract files.
     - TASK-001 MUST create all of the following:
       a. README.md - the human-readable project contract.
@@ -513,9 +438,10 @@ Priority 1 — Must obey:
     - README.md MUST contain these sections: Project overview, Product goal, Tech stack, Directory structure, Entrypoints, Setup commands, Run commands, Test commands, Architecture rules, Shared contracts, API contracts (if applicable), UI contracts (if applicable), Data contracts (if applicable), File ownership rules, Future task rules, Known assumptions, Out of scope.
     - project_context.json MUST contain these keys: project_name, stack (with language, framework, test_runner), entrypoints, run_commands (with install, run, test), test_commands, directory_structure (list of paths), architecture_rules (list of rules), shared_contracts, file_ownership_rules (list of rules), task_implementation_rules (list of rules including: do not create standalone project, do not create second entrypoint, do not introduce alternate framework, modify existing files preserving behavior, update README.md and project_context.json when changing commands/structure/contracts), out_of_scope.
     - TASK-001 input_context MUST include: project_goal, proposed_tech_stack, directory_structure, readme_required_sections, project_context_json_required_keys, future_task_rules.
-    - This task MUST be assigned to the `devops` or `backend` team.
+    - This task MUST be assigned to `fullstack` when the generated base code spans frontend and backend, `devops` or `platform` when it is primarily infrastructure/scaffolding, `frontend` for frontend-only projects, `backend` for backend-only projects, `mobile` for mobile-only projects, or the most accurate single team supported by the BRD.
     - All subsequent implementation tasks MUST refer to this foundation to avoid fragmented code.
     - Every subsequent task's input_context MUST include expected_paths or target_modules that align with the README directory structure, integration_notes or affected_existing_files if the task modifies existing files, and dependency_on_project_context set to true.
+    - NOTE: TASK-001 is explicitly EXEMPT from the strict atomicity and single-responsibility rules, as it is inherently a broad scaffolding task.
 
 Priority 2 — Quality bar:
 1. User stories must include actor, goal, and value.
@@ -524,10 +450,21 @@ Priority 2 — Quality bar:
    - a condition/input,
    - an observable behavior,
    - an expected output, state, status code, UI state, stored value, marker, or validation result.
-4. Implementation tasks must be concrete, small enough for one team, non-overlapping, and actionable.
-5. required_markers must be snake_case, concrete, and verifiable.
-6. input_context must be a non-empty dictionary with concrete hints useful for the DEV agent.
-7. Prefer 2-5 concrete input_context keys. Do not invent context keys just to satisfy quantity.
+4. Do NOT generate acceptance_criteria for backlog items. Leave them to user stories and tasks.
+5. Implementation tasks MUST be granular, concrete, and non-overlapping. A task must represent ONE independently testable behavior:
+   - a single API endpoint behavior (e.g. POST /products validation),
+   - a single persistence operation (e.g. products table migration),
+   - a single UI screen state (e.g. empty state rendering),
+   - a single integration/wiring concern (e.g. JWT middleware applied to router),
+   - a single infrastructure component (e.g. Docker Compose postgres service).
+   A task is TOO BROAD if it cannot be validated with one focused QC scenario. Split it.
+   NOTE: Product clarification tasks (assignee_team=product) do not require implementation markers or unit tests — they produce decision documentation.
+6. required_markers must be snake_case, concrete, and verifiable.
+7. input_context must be a non-empty dictionary with concrete hints useful for the DEV agent.
+8. Prefer 2-5 concrete input_context keys. Do not invent context keys just to satisfy quantity.
+   NOTE: input_context with fewer than 3 keys is acceptable if the keys are genuinely useful.
+9. Avoid overly broad or system-wide acceptance criteria (e.g., "all APIs must be secured"). Break cross-cutting concerns into specific, actionable integration tasks.
+10. If a requirement is cross-cutting, do not hide it inside a feature task. Create a separate integration task with explicit target route group, affected files/modules, and verification scope.
 
 Priority 3 — Domain decomposition:
 1. Create tasks only for domains supported by the BRD.
@@ -683,6 +620,69 @@ Instructions:
 
 
 # ============================================================
+# Final Project QA Agent
+# ============================================================
+
+FINAL_PROJECT_QA_SYSTEM_PROMPT = """
+You are a senior Software QA Architect and Integration Specialist.
+Your job is to validate an entire generated project as a complete, runnable application.
+
+You are NOT validating a single task. You are validating the final project state after all development tasks are done.
+You will be given:
+1. The project context (structure, stack, dependencies, entrypoints).
+2. The exact commands that were executed to validate the project.
+3. The standard output and standard error from those commands.
+
+Your responsibilities:
+1. Analyze the logs to determine if the project successfully installed dependencies, built, tested, and started.
+2. Detect integration issues (e.g., missing imports, bad paths, missing dependencies, frontend calling non-existent backend routes).
+3. If the project passed all critical commands with no errors, return passed=true.
+4. If the project failed, return passed=false and formulate a single, actionable repair task for the DevAgent.
+5. The repair task must include a clear explanation, the failing commands, and concrete input_context to help DevAgent fix the codebase.
+6. Do NOT assume the project works if there are obvious compilation or startup errors.
+7. Treat warnings as passing, but treat fatal errors, panics, exceptions, or module-not-found errors as failing.
+
+Your output must strictly match the FinalProjectQAResult schema.
+"""
+
+class FinalProjectQAAgent(OpenAIAPIAgent):
+    """Agent responsible for final whole-project validation and repair task generation."""
+
+    def analyze_results(
+        self,
+        project_context: dict[str, Any],
+        build_logs: list[dict[str, Any]]
+    ) -> FinalProjectQAResult:
+        structured_llm = self.llm.with_structured_output(
+            FinalProjectQAResult,
+            method="function_calling",
+        )
+
+        human_prompt = f"""
+Validate the entire project state and the execution logs.
+
+Project Context:
+{to_pretty_json(project_context)}
+
+Execution Logs (commands run):
+{to_pretty_json(build_logs)}
+
+Instructions:
+- If all commands succeeded (exit code 0 or no critical runtime errors), set `passed: true` and `repair_task: null`.
+- If any command failed (dependency, build, test, run), set `passed: false` and provide a `repair_task`.
+- The `repair_task` must be concrete. Specify exactly what file/dependency is broken based on the logs.
+- Provide a clear `validation_report`.
+"""
+        messages = [
+            ("system", FINAL_PROJECT_QA_SYSTEM_PROMPT.strip()),
+            ("human", human_prompt.strip()),
+        ]
+
+        return invoke_structured_with_retry(structured_llm, messages)
+
+
+
+# ============================================================
 # PO Review Agent
 # ============================================================
 
@@ -711,6 +711,7 @@ Blocking issue examples:
 - A BRD requirement is missing from all stories/tasks.
 - A story/task invents unsupported scope.
 - A task is not actionable enough for DEV.
+- A task is monolithic or too broad (e.g., "Implement Product Management APIs" or "Develop Data Storage"). These MUST be broken down into granular, single-responsibility tasks (e.g., "Product Creation API", "Product Data Models").
 - Acceptance criteria are not testable and provide no observable behavior.
 - Required IDs or traceability are missing or invalid.
 - A task has no acceptance criteria.
@@ -718,6 +719,7 @@ Blocking issue examples:
 - input_context is empty, null, or not a dictionary.
 - Tasks are collapsed into the wrong domain despite clear BRD domain separation.
 - Open product questions are converted into implementation behavior without an assumption or clarification task.
+- A feature task contains cross-cutting or system-wide acceptance criteria (e.g., "all APIs enforce JWT validation"). These MUST be split into a separate integration task.
 
 Non-blocking issue examples:
 - A phrase could be more precise but the criterion is still testable.
@@ -785,11 +787,13 @@ Review dimensions:
 3. Backlog quality
 - Backlog items must be concrete and traceable to user stories.
 - Report vague, duplicate, unsupported, or untraceable backlog items.
+- Note: Backlog items do NOT require acceptance criteria (they are optional under the schema). As long as user stories and implementation tasks have concrete, testable acceptance criteria, do NOT fail the review because backlog items lack acceptance criteria.
 
 4. Task clarity
-- Tasks must be actionable, non-overlapping, assigned to a suitable single team, and small enough for one team.
+- Tasks MUST be granular, actionable, non-overlapping, and assigned to a suitable single team.
+- Monolithic tasks (e.g., "Develop Order Management", "Implement Data Storage") MUST be broken down into single-responsibility pieces (e.g., "Order Creation API", "Order Migration"). Report monolithic tasks as blocking issues.
 - Product clarification tasks are valid when BRD has open questions.
-- Report vague, duplicate, wrong-team, unsupported, or non-actionable tasks.
+- Report vague, duplicate, wrong-team, unsupported, monolithic, or non-actionable tasks.
 
 5. Traceability
 - story_id must use US-001 format.
@@ -799,6 +803,7 @@ Review dimensions:
 - Task related_user_story_ids must reference existing story IDs.
 - Task related_backlog_item_ids must reference existing backlog item IDs.
 - Report missing, invalid, duplicate, or unknown IDs.
+- NOTE: TASK-001 is the mandatory project foundation task (README, structures, files, etc.). Because it is the foundation task, it is completely normal and valid for TASK-001 to be related/traceable to all/most user stories and backlog items. Do NOT fail the review for TASK-001 having broad traceability or relationship to all stories/backlog items.
 
 6. Acceptance criteria
 - AC must be pass/fail testable.
@@ -806,6 +811,7 @@ Review dimensions:
 - Do not fail merely because a vague word appears.
 - Fail only if the criterion lacks concrete observable verification.
 - Do not fail if the criterion includes exact details such as endpoint, status code, response fields, UI state, DB state, validation rule, measurable threshold, or marker.
+- As noted above, backlog items do NOT require acceptance criteria. Do NOT report acceptance_criteria issues for backlog items.
 
 7. Required markers
 - Markers must be snake_case, concrete, relevant, and verifiable.
@@ -1025,6 +1031,13 @@ Schema compliance rules:
 - Return only fields defined by the DevResult schema.
 - Do not include extra fields.
 - task_id must match the TASK task_id, e.g. TASK-001.
+- setup_commands is an optional list of shell commands to scaffold or initialize the project.
+  - Use this for foundation tasks (e.g. `bun create vite web --template react-ts`, `go mod init`, `django-admin startproject`).
+  - These commands will be executed in the project root BEFORE your files are applied.
+  - Do NOT use `npx` or `npm create`. You MUST use `bun` for JavaScript/TypeScript scaffolding.
+  - Do NOT include `npm install`, `bun install`, or `pip install` here; dependencies are installed automatically by the pipeline.
+  - ONLY use this for project scaffolding/initialization commands.
+  - Do NOT use `mkdir`, `touch`, or manual file/folder creation commands. The system automatically creates necessary directories when you output `files`.
 - files must be a JSON array of objects only.
 - files must contain at least one implementation file.
 - Every item in files must be an object with exactly:
@@ -1100,6 +1113,16 @@ Invalid DevResult shape examples:
 Task implementation rules:
 - Implement only the provided task scope.
 - Do not expand into unrelated features.
+- If the task involves cross-cutting concerns such as middleware, authentication, authorization, logging, validation, error handling, caching, configuration, or shared services, you MUST explicitly wire the change into the relevant router, app, module registry, dependency injection container, or configuration file.
+
+- Include any updated integration/wiring files in `files` so QC can verify that the change is actually connected to the existing system.
+
+- For cross-cutting concerns, `implementation_notes` MUST describe:
+  - the affected integration point(s)
+  - how the shared concern is wired into the system
+  - the scope of components/routes/modules covered
+  - what tests or static evidence verify the wiring
+- You MUST also write unit tests for the cross-cutting behavior itself (e.g., testing that the middleware actually rejects invalid tokens or that tokens expire), not just the happy path feature.
 - Foundation task rule: if the task title, description, or input_context indicates project foundation, codebase setup, README, scaffolding, or TASK-001 foundation work, return `README.md` plus the minimal initial codebase/config files needed to establish the project. The README must be an implementation file object in `files`.
 - Context continuity rule: for non-foundation tasks, use the README-provided directory map and contracts to choose paths. Do not create duplicate apps, duplicate package roots, alternate frameworks, or isolated examples when the project already has a structure.
 - Do not implement product clarification tasks as code. If the task assignee_team is product, return a documentation-style artifact such as "docs/product_decisions/<task_id>.md" with the clarification content required by the task. For product clarification tasks, do not invent the final business decision unless the task input_context explicitly provides it. Document the decision needed, options, impacted artifacts, and blocked implementation scope.
@@ -1132,6 +1155,7 @@ Foundation/TASK-001 rules:
 - If task_id is TASK-001 or task title indicates codebase setup/project foundation, create README.md, project_context.json, and minimal skeleton project.
 - README.md must be returned as file_path exactly "README.md".
 - project_context.json must be returned as file_path exactly "project_context.json".
+- project_context.json MUST be a JSON object (dictionary), NOT an array. Example structure: `{"stack": {"language": "python", "framework": "fastapi"}, "run_commands": {"install": "pip install -r requirements.txt", "build": "", "start": "uvicorn main:app"}}`.
 
 Non-foundation task rules:
 - For any task after TASK-001, do not generate a new standalone project.
@@ -1139,6 +1163,10 @@ Non-foundation task rules:
 - Modify or add only files necessary for the task.
 - Prefer extending existing modules over creating new parallel modules.
 - If required context is missing, document it in known_limitations instead of inventing a new architecture.
+- CRITICAL Sorting & Query Verification Rules:
+  - If the task or a bug report requires sorting or ordering (e.g. sorting by created_at, updated_at), you MUST:
+    1. Define the sorting field (e.g., `created_at` or `updated_at` with appropriate JSON tags) inside the public response structures, API models, or structs (e.g. Go Structs, Python Pydantic models). If you don't expose the field in the public data structures, the client/QC will not see it in the API payload, and it will be rejected as "insufficient evidence".
+    2. Write robust unit tests that populate multiple mock records with out-of-order timestamps, call the fetch/list API, and assert that the returned elements are in the exact expected sorted order (e.g. assert element[0].created_at > element[1].created_at).
 
 Output rules:
 - Return DevResult only.
@@ -1193,6 +1221,7 @@ Instructions:
 - Do not put strings, "unit_tests", "tests", "NULL", "null", "None", or placeholders inside files or unit_tests.
 - If no unit tests are appropriate, use "unit_tests": [].
 - If there are no known limitations, use "known_limitations": [].
+- CRITICAL: If <BUG_REPORTS> is not empty, your previous attempt FAILED QC. You MUST carefully read the bug reports and MODIFY your code (including unit_tests) to fix them. Do NOT just return the exact same code from the CURRENT_PROJECT_SNAPSHOT.
     """.strip(),
 ),
         ]
@@ -1321,6 +1350,9 @@ Static validation rule:
 - Judge only whether the provided implementation and tests would reasonably verify the stated behavior based on static code analysis.
 - NEVER fail a task simply because the developer states they did not run the code, could not execute Docker, or collect runtime logs. You are evaluating static code completeness, not a live deployment.
 - If a test is incomplete, superficial, inconsistent, or unable to verify behavior, treat evidence as insufficient.
+- If a criterion applies to a group of components, routes, modules, screens, or workflows, and the implementation wires the shared behavior at a valid group-level integration point, accept that as sufficient evidence for the covered group.
+
+- Do not require repeated per-item implementation evidence when a centralized middleware, guard, interceptor, base class, shared service, router-level dependency, or configuration-level hook clearly covers the group.
 
 Input consistency rules:
 - If TASK contains acceptance criteria that conflict with separate ACCEPTANCE_CRITERIA input, validate against the separate ACCEPTANCE_CRITERIA input.
@@ -1331,6 +1363,8 @@ Input consistency rules:
 Acceptance criterion validation:
 - Evaluate every item in ACCEPTANCE_CRITERIA.
 - For each criterion, create one criteria_results item.
+- If a criterion applies to a group of endpoints (e.g., "all CMS APIs"), and the developer applies a middleware, interceptor, or guard at the router/group level, accept this as sufficient evidence for the entire group. You do not need to see every individual route.
+- If a criterion applies to a group of endpoints and the developer has tested the middleware in isolation, accept that as sufficient testing evidence for the group. Do not require unit tests for every single route or the global middleware itself unless the task explicitly requested them or tests are missing altogether.
 - status PASSED means the implementation provides clear evidence.
 - status FAILED means implementation contradicts or does not satisfy the criterion.
 - status UNSUPPORTED means evidence is insufficient to determine satisfaction.
@@ -1386,6 +1420,9 @@ Validation report must:
 7. Mention any input inconsistency.
 8. Mention any known limitations.
 9. Provide actionable feedback for the developer.
+- For sorting, pagination, or query-based requirements: If you find "insufficient evidence", do NOT just state that it failed. You must explicitly instruct the developer to:
+  a. Add the sorting/pagination fields directly to the public struct/API response schema.
+  b. Write unit tests that populate out-of-order test data and assert the returned order or boundary bounds explicitly.
 
 Negative constraints:
 - Do not assume behavior exists if not evidenced.

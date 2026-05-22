@@ -212,10 +212,6 @@ class BacklogItemOut(StrictArtifactModel):
         default_factory=list,
         description="Assumptions relevant to this backlog item."
     )
-    acceptance_criteria: list[str] = Field(
-        default_factory=list,
-        description="Optional high-level acceptance criteria for this backlog item."
-    )
     source_references: list[str] = Field(
         default_factory=list,
         description="Optional references to BRD sections supporting this backlog item."
@@ -243,7 +239,7 @@ class BacklogItemOut(StrictArtifactModel):
             raise ValueError(f"invalid related_user_story_ids: {invalid}")
         return values
 
-    @field_validator("assumptions", "acceptance_criteria", "source_references")
+    @field_validator("assumptions", "source_references")
     @classmethod
     def validate_string_lists(cls, values: list[str]) -> list[str]:
         return _clean_string_list(values)
@@ -292,8 +288,11 @@ class TaskOut(StrictArtifactModel):
     def validate_input_context(cls, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ValueError("input_context must be a dictionary")
-        if len(value) < 3:
-            raise ValueError("input_context must contain at least 3 concrete keys")
+        # F-005: Require at least 1 non-empty key. The >=3 key requirement caused PO agents to
+        # invent context keys just to satisfy the count. The local reviewer emits a LOW-severity
+        # nudge for <3 keys, which is the appropriate enforcement level.
+        if len(value) < 1:
+            raise ValueError("input_context must not be empty — provide at least one concrete implementation hint")
 
         # Allow empty lists/dicts for specific keys that commonly have no items
         keys_allowing_empty = {
@@ -308,7 +307,7 @@ class TaskOut(StrictArtifactModel):
             if not str(k).strip():
                 raise ValueError("input_context contains empty key")
             # Only block if value is truly null/empty-string, OR if it's empty list/dict AND not in allowed set
-            if v in (None, "") or (not v and k not in keys_allowing_empty):
+            if v in (None, "") or (isinstance(v, (list, dict, set)) and not v and k not in keys_allowing_empty):
                 raise ValueError(f"input_context key '{k}' has invalid empty value: {v}")
 
         return value
@@ -388,6 +387,19 @@ class POResult(StrictArtifactModel):
         if value is None:
             return ""
         return value.strip()
+
+    @field_validator("resolution_map", mode="before")
+    @classmethod
+    def normalize_resolution_map(cls, value: Any) -> dict[str, str]:
+        if value is None:
+            return {}
+        if isinstance(value, dict):
+            # If the LLM generates a list of strings for a key, join them
+            return {
+                str(k): "; ".join(v) if isinstance(v, list) else str(v)
+                for k, v in value.items()
+            }
+        return value
 
     @model_validator(mode="after")
     def validate_cross_references(self) -> "POResult":
@@ -592,6 +604,10 @@ class TestFile(StrictArtifactModel):
 class DevResult(StrictArtifactModel):
     task_id: str = Field(
         description="Task id this implementation satisfies, e.g. TASK-001."
+    )
+    setup_commands: list[str] = Field(
+        default_factory=list,
+        description="Optional shell commands to scaffold or initialize the project (e.g., 'bun create vite . --template react-ts', 'go mod init <module>'). Run before files are applied."
     )
     files: list[ImplementedFile] = Field(
         default_factory=list,
@@ -804,4 +820,82 @@ class QCResult(StrictArtifactModel):
             if self.status == QCStatus.PASSED:
                 raise ValueError("If passed is false, status cannot be PASSED")
 
+        return self
+
+
+# ============================================================
+# Final Project QA output schema
+# ============================================================
+
+class FinalProjectQAFixTask(StrictArtifactModel):
+    title: str = Field(
+        description="Short title for the repair task."
+    )
+    description: str = Field(
+        description="Detailed explanation of what needs to be fixed based on the final project validation failures."
+    )
+    assignee_team: Team = Field(
+        description="The team responsible for fixing this. Usually backend, frontend, or devops."
+    )
+    acceptance_criteria: list[str] = Field(
+        default_factory=list,
+        description="Specific testable criteria to verify the fix."
+    )
+    required_markers: list[str] = Field(
+        default_factory=list,
+        description="Specific snake_case markers to verify the fix."
+    )
+    input_context: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Context for the DevAgent including failed commands, logs, files to edit, etc."
+    )
+
+    @field_validator("title", "description")
+    @classmethod
+    def validate_required_text(cls, value: str) -> str:
+        return _clean_text(value)
+
+    @field_validator("acceptance_criteria")
+    @classmethod
+    def validate_acceptance_criteria(cls, values: list[str]) -> list[str]:
+        return _clean_string_list(values)
+
+    @field_validator("required_markers")
+    @classmethod
+    def validate_required_markers(cls, values: list[str]) -> list[str]:
+        values = _clean_string_list(values, "required_markers")
+        invalid = [value for value in values if not _MARKER_PATTERN.match(value)]
+        if invalid:
+            raise ValueError(
+                f"invalid required_markers: {invalid}. "
+                "Markers must be snake_case identifiers with no spaces."
+            )
+        generic = [v for v in values if v in GENERIC_MARKERS_BLACKLIST]
+        if generic:
+            raise ValueError(f"Banned generic markers found: {generic}")
+        return values
+
+
+class FinalProjectQAResult(StrictArtifactModel):
+    passed: bool = Field(
+        description="True only if all commands ran successfully and the project validates as a complete runnable application."
+    )
+    status: str = Field(
+        description="Status description (e.g., 'PASSED', 'FAILED')."
+    )
+    validation_report: str = Field(
+        default="",
+        description="Detailed validation report of the project."
+    )
+    repair_task: FinalProjectQAFixTask | None = Field(
+        default=None,
+        description="A consolidated repair task for DevAgent if validation fails."
+    )
+
+    @model_validator(mode="after")
+    def validate_consistency(self) -> "FinalProjectQAResult":
+        if self.passed and self.repair_task is not None:
+            raise ValueError("If passed is true, repair_task must be null.")
+        if not self.passed and self.repair_task is None:
+            raise ValueError("If passed is false, repair_task must be provided.")
         return self

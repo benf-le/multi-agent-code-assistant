@@ -145,6 +145,7 @@ class OrchestratorService:
         latest_bug = self.ctx.task_repo.get_bug(task.latest_bug_id) if task.latest_bug_id else None
         return {
             'id': task.id,
+            'task_id': f'TASK-{task.task_number:03d}',
             'workflow_id': task.workflow_id,
             'task_number': task.task_number,
             'title': task.title,

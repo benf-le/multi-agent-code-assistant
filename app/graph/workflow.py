@@ -1,7 +1,7 @@
 from langgraph.graph import END, START, StateGraph
 
 from app.graph.nodes import WorkflowNodes
-from app.graph.router import route_by_qc_result, route_by_po_review, route_by_build_result, route_by_dependency_result
+from app.graph.router import route_by_qc_result, route_by_po_review, route_by_build_result, route_by_dependency_result, route_by_final_qa_result
 from app.graph.state import WorkflowState
 from app.core.logging_helper import WorkflowLogger
 
@@ -185,3 +185,34 @@ class WorkflowGraphFactory:
         New code should use build_po_graph() or build_task_graph() directly.
         """
         return self.build_task_graph()
+        
+    def build_final_qa_graph(self):
+        """Builds the final project QA graph.
+        
+        START → final_qa_validate
+              ├─ pass  → END
+              ├─ retry → create_final_qa_fix_task → END
+              └─ fail  → END
+        """
+        graph = StateGraph(WorkflowState)
+        
+        graph.add_node('final_qa_validate', self.nodes.final_qa_validate)
+        graph.add_node('create_final_qa_fix_task', self.nodes.create_final_qa_fix_task)
+        
+        graph.add_edge(START, 'final_qa_validate')
+        
+        graph.add_conditional_edges(
+            'final_qa_validate',
+            route_by_final_qa_result,
+            {
+                'pass': END,
+                'retry': 'create_final_qa_fix_task',
+                'fail': END
+            }
+        )
+        
+        graph.add_edge('create_final_qa_fix_task', END)
+        
+        compiled = graph.compile()
+        self._log_topology("final_qa_graph", compiled)
+        return compiled

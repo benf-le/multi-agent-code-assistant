@@ -1,4 +1,7 @@
+import json
+import asyncio
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -10,6 +13,7 @@ from app.schemas.common import EventLogRead, StateTransitionRead
 from app.schemas.task import TaskRead
 from app.schemas.workflow import TriggerWorkflowResponse, WorkflowDetailResponse, WorkflowRead
 from app.services.workflow_service import WorkflowService
+from app.services.log_streamer import log_streamer
 
 router = APIRouter(prefix='/workflows', tags=['workflows'])
 
@@ -129,3 +133,19 @@ def export_workflow_logs(workflow_id: int):
         return service.export_execution_log(workflow_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get('/{workflow_id}/logs/stream')
+async def stream_workflow_logs(workflow_id: int):
+    async def event_generator():
+        try:
+            async for log_entry in log_streamer.subscribe(workflow_id):
+                yield f"data: {json.dumps(log_entry)}\n\n"
+        except asyncio.CancelledError:
+            pass
+            
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@router.get('/{workflow_id}/logs')
+def get_workflow_logs(workflow_id: int):
+    return log_streamer.get_logs(workflow_id)
