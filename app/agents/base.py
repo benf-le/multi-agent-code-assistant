@@ -604,7 +604,7 @@ class DevResult(StrictArtifactModel):
     )
     setup_commands: list[str] = Field(
         default_factory=list,
-        description="Optional shell commands to scaffold or initialize the project (e.g., 'npm create vite@latest . --template react-ts'). Run before files are applied."
+        description="Optional shell commands to scaffold or initialize the project (e.g., 'bun create vite . --template react-ts', 'go mod init <module>'). Run before files are applied."
     )
     files: list[ImplementedFile] = Field(
         default_factory=list,

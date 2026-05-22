@@ -490,8 +490,6 @@ class WorkflowNodes:
         assert db_task is not None
         self.orchestrator.ctx.task_repo.save_task_output(db_task, output_payload)
         task_display = f"t-{current_task['task_number']:03d}"
-        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEV_DONE.value, AgentName.DEV.value, f"DEV completed task {task_display}.", task_id=current_task['id'])
-        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_DONE.value, AgentName.DEV.value, f"DEV finished implementation for {task_display}.")
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.DEV.value, 'SUCCESS', task_id=current_task['id'], input_payload={'task': current_task}, output_payload=output_payload)
         current_task['output_context'] = output_payload
         
@@ -542,6 +540,9 @@ class WorkflowNodes:
         # Do NOT commit to current_project yet — QC must validate first.
         candidate_project = apply_dev_result_to_project(snapshot_for_dev, dev_result)
         updated['candidate_project'] = candidate_project
+
+        self.orchestrator.update_workflow_status(updated['workflow_id'], WorkflowStatus.DEV_DONE.value, AgentName.DEV.value, f"DEV completed task {task_display}.", task_id=current_task['id'])
+        self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], TaskStatus.DEV_DONE.value, AgentName.DEV.value, f"DEV finished implementation for {task_display}.")
 
         updated['current_task'] = current_task
         updated['dev_output'] = output_payload
@@ -647,7 +648,12 @@ class WorkflowNodes:
         project_context = extract_project_context_from_current_project(updated.get('candidate_project', {}))
         
         from app.agents.build_runner import ensure_dependencies as runner_ensure_deps
-        dep_result = runner_ensure_deps(candidate_dir, project_context)
+        from app.services.log_streamer import log_streamer
+        
+        def on_log_line(line: str):
+            log_streamer.publish(updated['workflow_id'], line, "dependency")
+            
+        dep_result = runner_ensure_deps(candidate_dir, project_context, on_log_line=on_log_line)
         
         updated['dependency_result'] = dep_result
         if dep_result['passed']:
@@ -689,7 +695,12 @@ class WorkflowNodes:
         project_context = extract_project_context_from_current_project(updated.get('candidate_project', {}))
         
         from app.agents.build_runner import run_build
-        build_result = run_build(candidate_dir, project_context)
+        from app.services.log_streamer import log_streamer
+        
+        def on_log_line(line: str):
+            log_streamer.publish(updated['workflow_id'], line, "build")
+            
+        build_result = run_build(candidate_dir, project_context, on_log_line=on_log_line)
         
         updated['build_result'] = build_result
         if build_result['passed']:

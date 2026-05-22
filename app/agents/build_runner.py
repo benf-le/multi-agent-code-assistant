@@ -1,8 +1,12 @@
 import json
 import os
 import subprocess
+import threading
+import queue
+import time
+import re
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Callable, Optional
 
 def _parse_project_context(project_context_str: str | None) -> dict:
     if not project_context_str:
@@ -54,17 +58,13 @@ def _detect_install_cmd(candidate_path: Path, ctx: dict) -> str | None:
         return install_cmd
         
     if (candidate_path / "package.json").exists():
-        if (candidate_path / "bun.lockb").exists() or (candidate_path / "bun.lock").exists():
-            return "bun install"
-        if (candidate_path / "package-lock.json").exists():
-            return "npm ci"
         return "bun install"
     if (candidate_path / "requirements.txt").exists():
         return "pip install -r requirements.txt"
     if (candidate_path / "pyproject.toml").exists():
         return "poetry install"
     if (candidate_path / "go.mod").exists():
-        return "go mod download"
+        return "go mod tidy"
     if (candidate_path / "Cargo.toml").exists():
         return "cargo fetch"
     return None
@@ -87,45 +87,127 @@ def _detect_build_cmd(candidate_path: Path, ctx: dict) -> str | None:
             
     return None
 
-def run_command(command: str, cwd: Path, timeout: int, phase: str) -> Dict[str, Any]:
+def mask_secrets(text: str) -> str:
+    if not text:
+        return text
+    text = re.sub(r'sk-[a-zA-Z0-9]{48}', 'sk-***', text)
+    text = re.sub(r'ghp_[a-zA-Z0-9]{36}', 'ghp_***', text)
+    return text
+
+def _reader_thread(pipe, out_queue, stream_name, on_log_line):
+    for line in iter(pipe.readline, ''):
+        if line:
+            clean_line = mask_secrets(line.rstrip('\r\n'))
+            out_queue.put((stream_name, clean_line))
+            if on_log_line:
+                try:
+                    on_log_line(clean_line)
+                except Exception:
+                    pass
+    pipe.close()
+
+def run_command(
+    command: str, 
+    cwd: Path, 
+    timeout: int, 
+    phase: str, 
+    on_log_line: Optional[Callable[[str], None]] = None
+) -> Dict[str, Any]:
     env = os.environ.copy()
     env["CI"] = "true" 
     
+    start_time = time.time()
+    if on_log_line:
+        on_log_line(f"--- Executing: {command} (cwd: {cwd}) ---")
+
     try:
-        process = subprocess.run(
+        process = subprocess.Popen(
             command,
             shell=True,
             cwd=cwd,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=timeout,
+            encoding='utf-8',
+            errors='replace',
+            bufsize=1, # Line buffered
             env=env
         )
+        
+        out_queue = queue.Queue()
+        
+        stdout_thread = threading.Thread(target=_reader_thread, args=(process.stdout, out_queue, 'stdout', on_log_line))
+        stderr_thread = threading.Thread(target=_reader_thread, args=(process.stderr, out_queue, 'stderr', on_log_line))
+        
+        stdout_thread.daemon = True
+        stderr_thread.daemon = True
+        
+        stdout_thread.start()
+        stderr_thread.start()
+        
+        try:
+            process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout_thread.join()
+            stderr_thread.join()
+            
+            # Drain queue
+            stdout_lines = []
+            stderr_lines = []
+            while not out_queue.empty():
+                stream_name, line = out_queue.get()
+                if stream_name == 'stdout':
+                    stdout_lines.append(line)
+                else:
+                    stderr_lines.append(line)
+                    
+            stderr = "\n".join(stderr_lines) + f"\nProcess timed out after {timeout} seconds."
+            if on_log_line:
+                on_log_line(f"Process timed out after {timeout} seconds.")
+                
+            return {
+                "passed": False,
+                "command": command,
+                "phase": phase,
+                "exit_code": 124,
+                "stdout": "\n".join(stdout_lines),
+                "stderr": stderr,
+                "timeout_expired": True,
+            }
+            
+        stdout_thread.join()
+        stderr_thread.join()
+        
+        stdout_lines = []
+        stderr_lines = []
+        while not out_queue.empty():
+            stream_name, line = out_queue.get()
+            if stream_name == 'stdout':
+                stdout_lines.append(line)
+            else:
+                stderr_lines.append(line)
+                
         passed = (process.returncode == 0)
+        
+        duration = time.time() - start_time
+        if on_log_line:
+            status = "SUCCESS" if passed else f"FAILED (code {process.returncode})"
+            on_log_line(f"--- Finished: {command} in {duration:.1f}s [{status}] ---")
+
         return {
             "passed": passed,
             "command": command,
             "phase": phase,
             "exit_code": process.returncode,
-            "stdout": process.stdout,
-            "stderr": process.stderr,
+            "stdout": "\n".join(stdout_lines),
+            "stderr": "\n".join(stderr_lines),
             "timeout_expired": False,
         }
-    except subprocess.TimeoutExpired as e:
-        stdout = e.stdout.decode('utf-8', errors='replace') if isinstance(e.stdout, bytes) else (e.stdout or "")
-        stderr = e.stderr.decode('utf-8', errors='replace') if isinstance(e.stderr, bytes) else (e.stderr or "")
-        stderr += f"\nProcess timed out after {timeout} seconds."
-        return {
-            "passed": False,
-            "command": command,
-            "phase": phase,
-            "exit_code": 124,
-            "stdout": stdout,
-            "stderr": stderr,
-            "timeout_expired": True,
-        }
     except Exception as e:
+        if on_log_line:
+            on_log_line(f"Failed to execute: {str(e)}")
         return {
             "passed": False,
             "command": command,
@@ -222,7 +304,25 @@ def _format_result(results: list[Dict[str, Any]], language: str, default_phase: 
         "error_summary": "",
     }
 
-def ensure_dependencies(candidate_dir: str, project_context_str: str | None) -> dict:
+def get_estimated_install_time(command: str) -> int:
+    cmd_lower = command.lower()
+    if "bun install" in cmd_lower or "bun create" in cmd_lower:
+        return 15
+    if "npm ci" in cmd_lower or "npm install" in cmd_lower:
+        return 45
+    if "uv pip install" in cmd_lower:
+        return 10
+    if "pip install" in cmd_lower:
+        return 30
+    if "poetry install" in cmd_lower:
+        return 40
+    if "go mod" in cmd_lower:
+        return 5
+    if "cargo fetch" in cmd_lower:
+        return 20
+    return 30
+
+def ensure_dependencies(candidate_dir: str, project_context_str: str | None, on_log_line: Optional[Callable[[str], None]] = None) -> dict:
     candidate_path = Path(candidate_dir)
     ctx = _parse_project_context(project_context_str)
     language = _detect_language(candidate_path, ctx)
@@ -231,10 +331,10 @@ def ensure_dependencies(candidate_dir: str, project_context_str: str | None) -> 
     if not install_cmd:
         return _format_result([], language, "dependency")
         
-    res = run_command(install_cmd, candidate_path, 600, "dependency")
+    res = run_command(install_cmd, candidate_path, 600, "dependency", on_log_line)
     return _format_result([res], language, "dependency")
 
-def run_build(candidate_dir: str, project_context_str: str | None) -> dict:
+def run_build(candidate_dir: str, project_context_str: str | None, on_log_line: Optional[Callable[[str], None]] = None) -> dict:
     candidate_path = Path(candidate_dir)
     ctx = _parse_project_context(project_context_str)
     language = _detect_language(candidate_path, ctx)
@@ -243,5 +343,5 @@ def run_build(candidate_dir: str, project_context_str: str | None) -> dict:
     if not build_cmd:
         return _format_result([], language, "build")
         
-    res = run_command(build_cmd, candidate_path, 180, "build")
+    res = run_command(build_cmd, candidate_path, 180, "build", on_log_line)
     return _format_result([res], language, "build")

@@ -73,7 +73,7 @@ POReviewResult rules:
 
 DevResult rules:
 - task_id must use TASK-001 format.
-- setup_commands must be a list of strings (shell commands) to scaffold or initialize the project. Do NOT use npx or npm create; you MUST use bun for JS/TS.
+- setup_commands must be a list of strings (shell commands) to scaffold or initialize the project. Do NOT use npx or npm create; you MUST use bun for JS/TS. For Go, use `go mod init <module_name>`.
 - files must be a list of objects only.
 - Every files item must be an object with exactly file_path and code.
 - Never put strings such as "unit_tests", "NULL", "null", "None", "tests", or placeholders inside files.
