@@ -745,13 +745,14 @@ class WorkflowNodes:
             project_context=project_context,
             current_project_snapshot=candidate_project,
         )
-        task_display = f"t-{current_task['task_number']:03d}"
         self.orchestrator.record_agent_run(updated['workflow_id'], AgentName.QC.value, 'SUCCESS', task_id=current_task['id'], input_payload={'task': current_task, 'dev_output': updated.get('dev_output')}, output_payload=qc_result.model_dump())
-        self.orchestrator.update_workflow_status(updated['workflow_id'], qc_result.status, AgentName.QC.value, f"QC validated task {task_display}: {qc_result.status}", task_id=current_task['id'])
+        task_display = f"t-{current_task['task_number']:03d}"
+        wf_status = WorkflowStatus.QC_PASSED.value if qc_result.passed else WorkflowStatus.QC_FAILED.value
+        self.orchestrator.update_workflow_status(updated['workflow_id'], wf_status, AgentName.QC.value, f"QC validated task {task_display}: {qc_result.status}", task_id=current_task['id'])
         task_status = TaskStatus.DONE.value if qc_result.passed else TaskStatus.QC_FAILED.value
         self.orchestrator.update_task_status(updated['workflow_id'], current_task['id'], task_status, AgentName.QC.value, qc_result.validation_report)
         updated['qc_result'] = qc_result.model_dump()
-        updated['status'] = qc_result.status
+        updated['status'] = wf_status
         updated['current_agent'] = AgentName.QC.value
 
         # Record loop signature for detection (only on failure, since pass exits immediately)

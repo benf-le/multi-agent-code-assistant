@@ -288,8 +288,11 @@ class TaskOut(StrictArtifactModel):
     def validate_input_context(cls, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise ValueError("input_context must be a dictionary")
-        if len(value) < 3:
-            raise ValueError("input_context must contain at least 3 concrete keys")
+        # F-005: Require at least 1 non-empty key. The >=3 key requirement caused PO agents to
+        # invent context keys just to satisfy the count. The local reviewer emits a LOW-severity
+        # nudge for <3 keys, which is the appropriate enforcement level.
+        if len(value) < 1:
+            raise ValueError("input_context must not be empty — provide at least one concrete implementation hint")
 
         # Allow empty lists/dicts for specific keys that commonly have no items
         keys_allowing_empty = {

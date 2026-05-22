@@ -73,13 +73,13 @@ class WorkflowService:
     def _build_agents(self):
         if not self.settings.openai_api_key:
             raise ValueError("OPENAI_API_KEY is not set in environment. Real agents are required.")
-        
+
         kwargs = {
             "api_key": self.settings.openai_api_key,
             "base_url": self.settings.openai_base_url,
             "model": self.settings.openai_model,
         }
-        
+
         return (
             POAgent(**kwargs),
             POReviewAgent(**kwargs),
@@ -385,7 +385,11 @@ class WorkflowService:
         """Run the Final QA phase as a single graph invocation."""
         graph_factory = self._build_graph_factory(orchestrator)
         final_qa_graph = graph_factory.build_final_qa_graph()
-        
+
+        # F-002: Load the committed project from disk so final QA validates the actual codebase,
+        # not an empty dict. All tasks have written their output to 'project/' by this point.
+        current_project = self._load_project_from_disk(workflow.id)
+
         state = {
             'workflow_id': workflow.id,
             'brd_id': brd.id,
@@ -393,10 +397,10 @@ class WorkflowService:
             'status': workflow.status,
             'max_retry': workflow.max_retry,
             'current_agent': AgentName.ORCHESTRATOR.value,
-            'current_project': {},
+            'current_project': current_project,
             'final_project_qa_attempts': 0,
         }
-        
+
         workflow_id = workflow.id
 
         try:

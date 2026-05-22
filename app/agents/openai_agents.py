@@ -343,7 +343,11 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
                 ),
             })
 
-        if not task.acceptance_criteria:
+        # F-007: Product clarification tasks produce decision documents, not code.
+        # They cannot have implementable markers — exempt them from mandatory checks.
+        is_product_task = str(getattr(task, "assignee_team", "")).lower() == "product"
+
+        if not task.acceptance_criteria and not is_product_task:
             issues.append({
                 "category": "acceptance_criteria",
                 "severity": "HIGH",
@@ -352,7 +356,7 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
                 "suggestion": "Define at least one pass/fail observable acceptance criterion.",
             })
 
-        if not task.required_markers:
+        if not task.required_markers and not is_product_task:
             issues.append({
                 "category": "marker_quality",
                 "severity": "HIGH",
@@ -360,7 +364,7 @@ def validate_po_result_locally(po: POResult) -> list[dict]:
                 "affected_items": [f"{task.task_id}.required_markers"],
                 "suggestion": "Add concrete snake_case markers that DEV/QC can verify.",
             })
-        else:
+        elif task.required_markers:
             bad_markers = [
                 m for m in task.required_markers
                 if m in GENERIC_MARKERS_BLACKLIST
@@ -434,9 +438,10 @@ Priority 1 — Must obey:
     - README.md MUST contain these sections: Project overview, Product goal, Tech stack, Directory structure, Entrypoints, Setup commands, Run commands, Test commands, Architecture rules, Shared contracts, API contracts (if applicable), UI contracts (if applicable), Data contracts (if applicable), File ownership rules, Future task rules, Known assumptions, Out of scope.
     - project_context.json MUST contain these keys: project_name, stack (with language, framework, test_runner), entrypoints, run_commands (with install, run, test), test_commands, directory_structure (list of paths), architecture_rules (list of rules), shared_contracts, file_ownership_rules (list of rules), task_implementation_rules (list of rules including: do not create standalone project, do not create second entrypoint, do not introduce alternate framework, modify existing files preserving behavior, update README.md and project_context.json when changing commands/structure/contracts), out_of_scope.
     - TASK-001 input_context MUST include: project_goal, proposed_tech_stack, directory_structure, readme_required_sections, project_context_json_required_keys, future_task_rules.
-    - This task MUST be assigned to the `devops` or `backend` team.
+    - This task MUST be assigned to `fullstack` when the generated base code spans frontend and backend, `devops` or `platform` when it is primarily infrastructure/scaffolding, `frontend` for frontend-only projects, `backend` for backend-only projects, `mobile` for mobile-only projects, or the most accurate single team supported by the BRD.
     - All subsequent implementation tasks MUST refer to this foundation to avoid fragmented code.
     - Every subsequent task's input_context MUST include expected_paths or target_modules that align with the README directory structure, integration_notes or affected_existing_files if the task modifies existing files, and dependency_on_project_context set to true.
+    - NOTE: TASK-001 is explicitly EXEMPT from the strict atomicity and single-responsibility rules, as it is inherently a broad scaffolding task.
 
 Priority 2 — Quality bar:
 1. User stories must include actor, goal, and value.
@@ -446,10 +451,18 @@ Priority 2 — Quality bar:
    - an observable behavior,
    - an expected output, state, status code, UI state, stored value, marker, or validation result.
 4. Do NOT generate acceptance_criteria for backlog items. Leave them to user stories and tasks.
-5. Implementation tasks MUST be extremely granular, concrete, and non-overlapping. Break down monolithic features (e.g., 'Develop Order Management') into specific, single-responsibility tasks (e.g., 'Order Creation API', 'Order Listing API', 'Order Data Models', 'Order Checkout UI'). Do NOT create broad, catch-all tasks like 'Implement Data Storage' or 'Develop Feature X'.
+5. Implementation tasks MUST be granular, concrete, and non-overlapping. A task must represent ONE independently testable behavior:
+   - a single API endpoint behavior (e.g. POST /products validation),
+   - a single persistence operation (e.g. products table migration),
+   - a single UI screen state (e.g. empty state rendering),
+   - a single integration/wiring concern (e.g. JWT middleware applied to router),
+   - a single infrastructure component (e.g. Docker Compose postgres service).
+   A task is TOO BROAD if it cannot be validated with one focused QC scenario. Split it.
+   NOTE: Product clarification tasks (assignee_team=product) do not require implementation markers or unit tests — they produce decision documentation.
 6. required_markers must be snake_case, concrete, and verifiable.
 7. input_context must be a non-empty dictionary with concrete hints useful for the DEV agent.
 8. Prefer 2-5 concrete input_context keys. Do not invent context keys just to satisfy quantity.
+   NOTE: input_context with fewer than 3 keys is acceptable if the keys are genuinely useful.
 9. Avoid overly broad or system-wide acceptance criteria (e.g., "all APIs must be secured"). Break cross-cutting concerns into specific, actionable integration tasks.
 10. If a requirement is cross-cutting, do not hide it inside a feature task. Create a separate integration task with explicit target route group, affected files/modules, and verification scope.
 
@@ -1150,6 +1163,10 @@ Non-foundation task rules:
 - Modify or add only files necessary for the task.
 - Prefer extending existing modules over creating new parallel modules.
 - If required context is missing, document it in known_limitations instead of inventing a new architecture.
+- CRITICAL Sorting & Query Verification Rules:
+  - If the task or a bug report requires sorting or ordering (e.g. sorting by created_at, updated_at), you MUST:
+    1. Define the sorting field (e.g., `created_at` or `updated_at` with appropriate JSON tags) inside the public response structures, API models, or structs (e.g. Go Structs, Python Pydantic models). If you don't expose the field in the public data structures, the client/QC will not see it in the API payload, and it will be rejected as "insufficient evidence".
+    2. Write robust unit tests that populate multiple mock records with out-of-order timestamps, call the fetch/list API, and assert that the returned elements are in the exact expected sorted order (e.g. assert element[0].created_at > element[1].created_at).
 
 Output rules:
 - Return DevResult only.
@@ -1403,6 +1420,9 @@ Validation report must:
 7. Mention any input inconsistency.
 8. Mention any known limitations.
 9. Provide actionable feedback for the developer.
+- For sorting, pagination, or query-based requirements: If you find "insufficient evidence", do NOT just state that it failed. You must explicitly instruct the developer to:
+  a. Add the sorting/pagination fields directly to the public struct/API response schema.
+  b. Write unit tests that populate out-of-order test data and assert the returned order or boundary bounds explicitly.
 
 Negative constraints:
 - Do not assume behavior exists if not evidenced.

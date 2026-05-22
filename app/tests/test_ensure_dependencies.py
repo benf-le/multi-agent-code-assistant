@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 def test_ensure_dependencies_integer_task_id():
     orchestrator = MagicMock()
     orchestrator.check_cancellation.return_value = False
-    nodes = WorkflowNodes(orchestrator, MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    nodes = WorkflowNodes(orchestrator, MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock())
 
     state: WorkflowState = {
         'workflow_id': 1,
@@ -28,7 +28,7 @@ def test_ensure_dependencies_integer_task_id():
 def test_ensure_dependencies_validation_failure():
     orchestrator = MagicMock()
     orchestrator.check_cancellation.return_value = False
-    nodes = WorkflowNodes(orchestrator, MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    nodes = WorkflowNodes(orchestrator, MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock())
 
     state: WorkflowState = {
         'workflow_id': 2,
@@ -60,7 +60,7 @@ def test_should_skip_db_or_migration_check():
 def test_ensure_dependencies_db_only_task():
     orchestrator = MagicMock()
     orchestrator.check_cancellation.return_value = False
-    nodes = WorkflowNodes(orchestrator, MagicMock(), MagicMock(), MagicMock(), MagicMock())
+    nodes = WorkflowNodes(orchestrator, MagicMock(), MagicMock(), MagicMock(), MagicMock(), MagicMock())
 
     state: WorkflowState = {
         'workflow_id': 3,
